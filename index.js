@@ -11,7 +11,17 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TOKEN}`
 const userState = {}
 
 // Documenti caricati (in memoria)
-const documents = {}
+const documents = // TTL cleanup: ogni minuto elimina documenti scaduti
+setInterval(async () => {
+  const now = Date.now()
+  for (const fileId of Object.keys(documents)) {
+    if (documents[fileId].expiresAt <= now) {
+      const expiredName = documents[fileId].name
+      delete documents[fileId]
+      console.log(`🗑 Scaduto e rimosso: ${expiredName} (${fileId})`)
+    }
+  }
+}, 60 * 1000)
 
 app.post('/webhook', async (req, res) => {
   const message = req.body.message
