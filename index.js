@@ -23,7 +23,33 @@ setInterval(async () => {
   }
 }, 60 * 1000)
 
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', // Comando /docs: lista documenti attivi
+if (text === '/docs') {
+  const now = Date.now()
+  const active = Object.values(documents)
+    .filter(d => d.expiresAt > now)
+    .sort((a, b) => a.expiresAt - b.expiresAt)
+
+  if (active.length === 0) {
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: chatId,
+      text: '📭 Nessun documento attivo al momento.'
+    })
+  } else {
+    const lines = active.map((d, idx) => {
+      const minsLeft = Math.max(0, Math.round((d.expiresAt - now) / 60000))
+      const hours = Math.floor(minsLeft / 60)
+      const mins = minsLeft % 60
+      const left = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`
+      return `${idx + 1}. ${d.name} — ⏳ scade tra ${left}`
+    })
+
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: chatId,
+      text: `📚 Documenti attivi (24h)\n\n${lines.join('\n')}`
+    })
+  }
+}async (req, res) => {
   const message = req.body.message
   if (!message) return res.sendStatus(200)
 
