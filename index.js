@@ -10,12 +10,11 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TOKEN}`
 const userState = {}
 const documents = {}
 
-// TTL cleanup
+// TTL cleanup (ogni minuto)
 setInterval(() => {
   const now = Date.now()
   for (const id of Object.keys(documents)) {
     if (documents[id].expiresAt <= now) {
-      console.log(`🗑 Rimosso: ${documents[id].name}`)
       delete documents[id]
     }
   }
@@ -28,6 +27,7 @@ app.post('/webhook', async (req, res) => {
   const chatId = message.chat.id
   const text = message.text
 
+  // /upload
   if (text === '/upload') {
     userState[chatId] = 'WAITING_DOCUMENT'
     await axios.post(`${TELEGRAM_API}/sendMessage`, {
@@ -36,6 +36,7 @@ app.post('/webhook', async (req, res) => {
     })
   }
 
+  // /docs
   if (text === '/docs') {
     const now = Date.now()
     const active = Object.values(documents)
@@ -47,7 +48,7 @@ app.post('/webhook', async (req, res) => {
       })
     } else {
       const lines = active.map((d, i) => {
-        const mins = Math.round((d.expiresAt - now) / 60000)
+        const mins = Math.max(0, Math.round((d.expiresAt - now) / 60000))
         return `${i + 1}. ${d.name} — ⏳ ${mins} min`
       })
 
@@ -58,6 +59,7 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
+  // ricezione documento
   if (message.document && userState[chatId] === 'WAITING_DOCUMENT') {
     documents[message.document.file_id] = {
       name: message.document.file_name,
