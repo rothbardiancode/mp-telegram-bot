@@ -165,14 +165,69 @@ let weeztixLastRaw = null;
 
 function parseWeeztixStats(data) {
   const out = [];
-  const push = (name, sold, scanned) => {
-    if (!name) return;
-    out.push({
-      name: String(name),
-      sold: Number(sold ?? 0),
-      scanned: Number(scanned ?? 0)
-    });
+
+  // helper: prova a estrarre buckets da un path annidato
+  const getBuckets = (obj, pathArr) => {
+    let cur = obj;
+    for (const p of pathArr) {
+      if (!cur || typeof cur !== 'object') return null;
+      cur = cur[p];
+    }
+    return Array.isArray(cur) ? cur : null;
   };
+
+  const aggs = data && data.aggregations ? data.aggregations : null;
+  if (!aggs) return out;
+
+  // 1) SOLD: aggregations.ticketCount.statistics.statistics.buckets
+  const soldBuckets =
+    getBuckets(aggs, ['ticketCount', 'statistics', 'statistics', 'buckets']) ||
+    getBuckets(aggs, ['ticketCount', 'statistics', 'buckets']) ||
+    getBuckets(aggs, ['ticketCount', 'buckets']);
+
+  // 2) SCANNED: cerchiamo un aggregation che contenga "scan"/"scanned"/"check" con buckets
+  let scannedBuckets = null;
+  for (const [k, v] of Object.entries(aggs)) {
+    const key = String(k).toLowerCase();
+    if (key.includes('scan') || key.includes('scanned') || key.includes('check') || key.includes('entry')) {
+      scannedBuckets =
+        getBuckets(v, ['statistics', 'statistics', 'buckets']) ||
+        getBuckets(v, ['statistics', 'buckets']) ||
+        getBuckets(v, ['buckets']);
+      if (scannedBuckets) break;
+    }
+  }
+
+  // Normalizziamo in map guid -> count
+  const soldById = {};
+  if (soldBuckets) {
+    for (const b of soldBuckets) {
+      if (b && b.key) soldById[String(b.key)] = Number(b.doc_count || 0);
+    }
+  }
+
+  const scannedById = {};
+  if (scannedBuckets) {
+    for (const b of scannedBuckets) {
+      if (b && b.key) scannedById[String(b.key)] = Number(b.doc_count || 0);
+    }
+  }
+
+  // Se non abbiamo nemmeno soldBuckets, non possiamo fare nulla
+  const ids = Object.keys(soldById);
+  if (!ids.length) return out;
+
+  // Nomi: per ora usiamo il GUID (poi lo mappiamo a Wave 1/2/Final)
+  for (const id of ids) {
+    out.push({
+      name: id,                 // per ora GUID
+      sold: soldById[id] || 0,
+      scanned: scannedById[id] || 0
+    });
+  }
+
+  return out;
+}
 
   // Try common array shapes
   const arrays = [
