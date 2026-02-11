@@ -280,7 +280,6 @@ function parseWeeztixStats(data) {
   }
 
   return [];
-}
 
 function waveLabel(name) {
   const n = String(name || '').toLowerCase();
