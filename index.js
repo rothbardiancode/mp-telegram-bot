@@ -92,7 +92,7 @@ let weeztixLastError = null
 
 // normalized ticket stats (per ticket type)
 // [{ name, sold, scanned }]
-let weeztixTicketStats = []
+let weeztixTicketStats = [] let weeztixLastRaw = null
 
 function parseWeeztixStats(data) {
   const out = []
@@ -197,7 +197,7 @@ async function fetchWeeztixStats() {
     // Dashboard statistics endpoint (event scoped)
     const url = `https://api.weeztix.com/statistics/dashboard/${WEEZTIX_EVENT_GUID}`
 
-    const resp = await axios.get(url, {
+    const resp = await axios.get(url, {weeztixLastRaw = resp.data
       timeout: 15000,
       headers: {
         Authorization: `Bearer ${token}`
@@ -307,7 +307,13 @@ app.post('/webhook', async (req, res) => {
   await tgSend(
     chatId,
     `🛠 DEBUG WEEZTIX\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}`
-  )
+  if (text.startsWith('/debugweeztix_raw')) {
+  const preview = weeztixLastRaw
+    ? JSON.stringify(weeztixLastRaw, null, 2).slice(0, 3500)
+    : '(vuoto)'
+  await tgSend(chatId, `🧾 WEEZTIX RAW (trimmed)\n\n${preview}`)
+  return res.sendStatus(200)
+})
   return res.sendStatus(200)
 }
 
