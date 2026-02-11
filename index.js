@@ -93,7 +93,6 @@ let weeztixLastError = null
 // normalized ticket stats (per ticket type)
 // [{ name, sold, scanned }]
 let weeztixTicketStats = []
-let weeztixLastRaw = null
 
 function parseWeeztixStats(data) {
   const out = []
@@ -266,7 +265,7 @@ app.get('/weeztix/callback', async (req, res) => {
     if (!req.query.code) return res.status(400).send('Missing code')
     if (!req.query.state || req.query.state !== OAUTH_STATE) return res.status(400).send('Bad state')
 
-    const r = await axios.post('https://auth.weeztix.com/tokens', {weeztixLastRaw = resp.data
+    const r = await axios.post('https://auth.weeztix.com/tokens', {
       grant_type: 'authorization_code',
       client_id: process.env.OAUTH_CLIENT_ID,
       client_secret: process.env.OAUTH_CLIENT_SECRET,
@@ -307,30 +306,20 @@ app.post('/webhook', async (req, res) => {
 
     // --- Weeztix commands ---
     if (text.startsWith('/debugweeztix')) {
-      const sample = weeztixTicketStats
-        .slice(0, 12)
-        .map(s => `• ${s.name} | sold=${s.sold} | scanned=${s.scanned}`)
-        .join('\n')
-      const topKeys = weeztixLastRaw ? Object.keys(weeztixLastRaw).slice(0, 30) : []
-let nestedKeys = []
-if (weeztixLastRaw && typeof weeztixLastRaw === 'object') {
-  const firstObjKey = topKeys.find(k => weeztixLastRaw[k] && typeof weeztixLastRaw[k] === 'object')
-  if (firstObjKey) nestedKeys = Object.keys(weeztixLastRaw[firstObjKey]).slice(0, 30).map(k => `${firstObjKey}.${k}`)
+  let preview = '(vuoto)'
+
+  if (weeztixLastRaw) {
+    preview = JSON.stringify(weeztixLastRaw, null, 2)
+    preview = preview.slice(0, 3500) // evita messaggi troppo lunghi
+  }
+
+  await tgSend(
+    chatId,
+    `🛠 DEBUG WEEZTIX\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\n\nRAW PREVIEW:\n${preview}`
+  )
+
+  return res.sendStatus(200)
 }
-
-const shape =
-  `Top keys: ${topKeys.join(', ') || '(none)'}\n` +
-  `Nested keys: ${nestedKeys.join(', ') || '(none)'}`
-
-      await tgSend(await tgSend(
-  chatId,
-  `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\n\n${shape}\n\nSample:\n${sample || '(vuoto)'}`
-)
-        chatId,
-        `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\n\nSample:\n${sample || '(vuoto)'}`
-      )
-      return res.sendStatus(200)
-    }
 
     if (text.startsWith('/biglietti')) {
       if (!weeztixTicketStats.length) {
