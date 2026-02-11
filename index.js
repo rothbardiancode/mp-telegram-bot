@@ -3,6 +3,43 @@ const axios = require('axios')
 
 const app = express()
 app.use(express.json())
+const crypto = require('crypto');
+
+let OAUTH_STATE = null;
+
+app.get('/weeztix/connect', (req, res) => {
+  OAUTH_STATE = crypto.randomBytes(16).toString('hex');
+  const url = new URL('https://login.weeztix.com/login');
+  url.searchParams.set('client_id', process.env.OAUTH_CLIENT_ID);
+  url.searchParams.set('redirect_uri', process.env.OAUTH_CLIENT_REDIRECT);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('state', OAUTH_STATE);
+  res.redirect(url.toString());
+});
+
+// Weeztix redirects here with ?code=...&state=...
+app.get('/weeztix/callback', async (req, res) => {
+  try {
+    if (!req.query.code) return res.status(400).send('Missing code');
+    if (!req.query.state || req.query.state !== OAUTH_STATE) return res.status(400).send('Bad state');
+
+    const r = await axios.post('https://auth.weeztix.com/tokens', {
+      grant_type: 'authorization_code',
+      client_id: process.env.OAUTH_CLIENT_ID,
+      client_secret: process.env.OAUTH_CLIENT_SECRET,
+      redirect_uri: process.env.OAUTH_CLIENT_REDIRECT,
+      code: req.query.code
+    });
+
+    // IMPORTANT: COPIA IL refresh_token e mettilo su Render come env var
+    console.log('WEEZTIX TOKEN RESPONSE:', r.data);
+
+    res.send('✅ Weeztix connected. Now set WEEZTIX_REFRESH_TOKEN on Render (check logs).');
+  } catch (e) {
+    console.error(e?.response?.data || e.message);
+    res.status(500).send('Token exchange failed (check logs).');
+  }
+});
 
 const TOKEN = process.env.BOT_TOKEN
 const TELEGRAM_API = `https://api.telegram.org/bot${TOKEN}`
