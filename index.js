@@ -166,7 +166,9 @@ let weeztixLastRaw = null;
 function parseWeeztixStats(data) {
   const out = [];
 
-  // helper: prova a estrarre buckets da un path annidato
+  const aggs = data && data.aggregations ? data.aggregations : null;
+  if (!aggs) return out;
+
   const getBuckets = (obj, pathArr) => {
     let cur = obj;
     for (const p of pathArr) {
@@ -175,6 +177,53 @@ function parseWeeztixStats(data) {
     }
     return Array.isArray(cur) ? cur : null;
   };
+
+  // SOLD buckets (this matches your payload)
+  const soldBuckets =
+    getBuckets(aggs, ['ticketCount', 'statistics', 'statistics', 'buckets']) ||
+    getBuckets(aggs, ['ticketCount', 'statistics', 'buckets']) ||
+    getBuckets(aggs, ['ticketCount', 'buckets']);
+
+  // Try to find SCANNED buckets (may or may not exist in payload)
+  let scannedBuckets = null;
+  for (const [k, v] of Object.entries(aggs)) {
+    const key = String(k).toLowerCase();
+    if (key.includes('scan') || key.includes('scanned') || key.includes('check') || key.includes('entry')) {
+      scannedBuckets =
+        getBuckets(v, ['statistics', 'statistics', 'buckets']) ||
+        getBuckets(v, ['statistics', 'buckets']) ||
+        getBuckets(v, ['buckets']);
+      if (scannedBuckets) break;
+    }
+  }
+
+  const soldById = {};
+  if (soldBuckets) {
+    for (const b of soldBuckets) {
+      if (b && b.key) soldById[String(b.key)] = Number(b.doc_count || 0);
+    }
+  }
+
+  const scannedById = {};
+  if (scannedBuckets) {
+    for (const b of scannedBuckets) {
+      if (b && b.key) scannedById[String(b.key)] = Number(b.doc_count || 0);
+    }
+  }
+
+  const ids = Object.keys(soldById);
+  if (!ids.length) return out;
+
+  for (const id of ids) {
+    out.push({
+      name: id,
+      sold: soldById[id] || 0,
+      scanned: scannedById[id] || 0
+    });
+  }
+
+  return out;
+};
 
   const aggs = data && data.aggregations ? data.aggregations : null;
   if (!aggs) return out;
