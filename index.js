@@ -58,24 +58,29 @@ let WEEZTIX_ACCESS_EXPIRES_AT = 0
 async function refreshAccessToken() {
   const now = Date.now()
 
-  // reuse token if still valid (1 min safety margin)
-  if (WEEZTIX_ACCESS_TOKEN && now < WEEZTIX_ACCESS_EXPIRES_AT - 60_000) {
+  if (WEEZTIX_ACCESS_TOKEN && now < WEEZTIX_ACCESS_EXPIRES_AT - 60000) {
     return WEEZTIX_ACCESS_TOKEN
   }
 
-  if (!process.env.WEEZTIX_REFRESH_TOKEN) throw new Error('Missing env var: WEEZTIX_REFRESH_TOKEN')
-  if (!process.env.OAUTH_CLIENT_ID) throw new Error('Missing env var: OAUTH_CLIENT_ID')
-  if (!process.env.OAUTH_CLIENT_SECRET) throw new Error('Missing env var: OAUTH_CLIENT_SECRET')
+  const params = new URLSearchParams()
+  params.append('grant_type', 'refresh_token')
+  params.append('refresh_token', process.env.WEEZTIX_REFRESH_TOKEN)
+  params.append('client_id', process.env.OAUTH_CLIENT_ID)
+  params.append('client_secret', process.env.OAUTH_CLIENT_SECRET)
 
-  const r = await axios.post('https://auth.weeztix.com/tokens', {
-    grant_type: 'refresh_token',
-    refresh_token: process.env.WEEZTIX_REFRESH_TOKEN,
-    client_id: process.env.OAUTH_CLIENT_ID,
-    client_secret: process.env.OAUTH_CLIENT_SECRET
-  })
+  const r = await axios.post(
+    'https://auth.weeztix.com/tokens',
+    params,
+    {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    }
+  )
 
   WEEZTIX_ACCESS_TOKEN = r.data.access_token
   WEEZTIX_ACCESS_EXPIRES_AT = now + (Number(r.data.expires_in || 0) * 1000)
+
   return WEEZTIX_ACCESS_TOKEN
 }
 
