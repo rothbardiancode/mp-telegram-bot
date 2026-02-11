@@ -303,6 +303,13 @@ app.post('/webhook', async (req, res) => {
 
     const chatId = message.chat.id
     const text = (message.text || '').trim()
+    if (text.startsWith('/debugweeztix')) {
+  await tgSend(
+    chatId,
+    `🛠 DEBUG WEEZTIX\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}`
+  )
+  return res.sendStatus(200)
+}
 
     // --- Weeztix commands ---
     if (text.startsWith('/debugweeztix')) {
