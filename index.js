@@ -62,21 +62,30 @@ async function refreshAccessToken() {
     return WEEZTIX_ACCESS_TOKEN
   }
 
+  const basicAuth = Buffer.from(
+    `${process.env.OAUTH_CLIENT_ID}:${process.env.OAUTH_CLIENT_SECRET}`
+  ).toString('base64')
+
   const params = new URLSearchParams()
   params.append('grant_type', 'refresh_token')
   params.append('refresh_token', process.env.WEEZTIX_REFRESH_TOKEN)
-  params.append('client_id', process.env.OAUTH_CLIENT_ID)
-  params.append('client_secret', process.env.OAUTH_CLIENT_SECRET)
 
   const r = await axios.post(
     'https://auth.weeztix.com/tokens',
     params,
     {
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${basicAuth}`
       }
     }
   )
+
+  WEEZTIX_ACCESS_TOKEN = r.data.access_token
+  WEEZTIX_ACCESS_EXPIRES_AT = now + (Number(r.data.expires_in || 0) * 1000)
+
+  return WEEZTIX_ACCESS_TOKEN
+}
 
   WEEZTIX_ACCESS_TOKEN = r.data.access_token
   WEEZTIX_ACCESS_EXPIRES_AT = now + (Number(r.data.expires_in || 0) * 1000)
