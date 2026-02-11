@@ -1,19 +1,19 @@
 /**
- * MP Telegram Bot + Weeztix OAuth + Polling
+ * MP Telegram Bot + Weeztix OAuth + Stats Polling
  *
- * Required ENV:
- * - BOT_TOKEN
- * - OAUTH_CLIENT_ID
- * - OAUTH_CLIENT_SECRET
- * - OAUTH_CLIENT_REDIRECT  (e.g. https://mp-telegram-bot-den5.onrender.com/weeztix/callback)
- * - WEEZTIX_EVENT_GUID
- * - MP_CAPACITY (e.g. 400)
+ * Render ENV required:
+ * BOT_TOKEN
+ * OAUTH_CLIENT_ID
+ * OAUTH_CLIENT_SECRET
+ * OAUTH_CLIENT_REDIRECT   (https://mp-telegram-bot-den5.onrender.com/weeztix/callback)
+ * WEEZTIX_EVENT_GUID
+ * MP_CAPACITY             (e.g. 400)
  *
- * After first connect:
- * - WEEZTIX_REFRESH_TOKEN
+ * After connecting:
+ * WEEZTIX_REFRESH_TOKEN
  *
  * Optional:
- * - WEEZTIX_POLL_SECONDS (default 60)
+ * WEEZTIX_POLL_SECONDS (default 60)
  */
 
 const express = require('express');
@@ -90,7 +90,7 @@ app.get('/weeztix/callback', async (req, res) => {
       return res.status(500).send('Missing OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OAUTH_CLIENT_REDIRECT in env');
     }
 
-    // Exchange authorization code for tokens
+    // Exchange authorization_code for tokens
     const params = new URLSearchParams();
     params.append('grant_type', 'authorization_code');
     params.append('client_id', clientId);
@@ -103,10 +103,9 @@ app.get('/weeztix/callback', async (req, res) => {
       timeout: 15000
     });
 
-    // Contains refresh_token (copy it into Render ENV as WEEZTIX_REFRESH_TOKEN)
-    console.log('WEEZTIX TOKEN RESPONSE:', r.data);
+    console.log('WEEZTIX TOKEN RESPONSE:', r.data); // copy refresh_token to env
 
-    return res.send('✅ Weeztix connected. Check Render logs for refresh_token and set WEEZTIX_REFRESH_TOKEN in env.');
+    return res.send('✅ Weeztix connected. Check Render logs and set WEEZTIX_REFRESH_TOKEN in env.');
   } catch (e) {
     console.error('Callback error:', e?.response?.data || e.message || e);
     return res.status(500).send('Token exchange failed. Check Render logs.');
@@ -120,7 +119,7 @@ let WEEZTIX_ACCESS_EXPIRES_AT = 0;
 async function refreshAccessToken() {
   const now = Date.now();
 
-  if (WEEZTIX_ACCESS_TOKEN && now < WEEZTIX_ACCESS_EXPIRES_AT - 60000) {
+  if (WEEZTIX_ACCESS_TOKEN && now < WEEZTIX_ACCESS_EXPIRES_AT - 60_000) {
     return WEEZTIX_ACCESS_TOKEN;
   }
 
@@ -131,15 +130,13 @@ async function refreshAccessToken() {
   if (!clientId || !clientSecret) throw new Error('Missing OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET');
   if (!refreshToken) throw new Error('Missing WEEZTIX_REFRESH_TOKEN');
 
-  // Use x-www-form-urlencoded; send BOTH Basic Auth and client_id/client_secret in body (most compatible)
   const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
 
   const params = new URLSearchParams();
   params.append('grant_type', 'refresh_token');
   params.append('refresh_token', refreshToken);
-  params.append('client_id', clientId);
-  params.append('client_secret', clientSecret);
 
+  // Many providers accept Basic Auth; Weeztix worked for you with auth_check.
   const r = await axios.post('https://auth.weeztix.com/tokens', params, {
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -160,31 +157,41 @@ const WEEZTIX_POLL_SECONDS = Number(process.env.WEEZTIX_POLL_SECONDS || 60);
 
 let weeztixLastOkAt = null;
 let weeztixLastError = null;
-let weeztixTicketStats = []; // [{name, sold, scanned}]
 let weeztixLastRaw = null;
 
+// normalized stats: [{ id, sold, scanned }]
+let weeztixTicketStats = [];
+
+/**
+ * Parser tailored to your payload:
+ * aggregations.ticketCount.statistics.statistics.buckets => [{key: <ticketTypeGuid>, doc_count: <sold>}]
+ *
+ * For scanned, we try to discover an aggregation key containing scan/check/entry.
+ * If not found, scanned will be 0.
+ */
 function parseWeeztixStats(data) {
   const out = [];
-
   const aggs = data && data.aggregations ? data.aggregations : null;
   if (!aggs) return out;
 
-  const getBuckets = (obj, pathArr) => {
+  const getBuckets = (obj, path) => {
     let cur = obj;
-    for (const p of pathArr) {
+    for (const p of path) {
       if (!cur || typeof cur !== 'object') return null;
       cur = cur[p];
     }
     return Array.isArray(cur) ? cur : null;
   };
 
-  // SOLD buckets (this matches your payload)
+  // SOLD buckets (confirmed by your raw)
   const soldBuckets =
     getBuckets(aggs, ['ticketCount', 'statistics', 'statistics', 'buckets']) ||
     getBuckets(aggs, ['ticketCount', 'statistics', 'buckets']) ||
     getBuckets(aggs, ['ticketCount', 'buckets']);
 
-  // Try to find SCANNED buckets (may or may not exist in payload)
+  if (!soldBuckets || soldBuckets.length === 0) return out;
+
+  // SCANNED buckets: try best-effort discovery
   let scannedBuckets = null;
   for (const [k, v] of Object.entries(aggs)) {
     const key = String(k).toLowerCase();
@@ -193,84 +200,26 @@ function parseWeeztixStats(data) {
         getBuckets(v, ['statistics', 'statistics', 'buckets']) ||
         getBuckets(v, ['statistics', 'buckets']) ||
         getBuckets(v, ['buckets']);
-      if (scannedBuckets) break;
+      if (scannedBuckets && scannedBuckets.length) break;
     }
   }
 
   const soldById = {};
-  if (soldBuckets) {
-    for (const b of soldBuckets) {
-      if (b && b.key) soldById[String(b.key)] = Number(b.doc_count || 0);
-    }
+  for (const b of soldBuckets) {
+    if (b && b.key) soldById[String(b.key)] = Number(b.doc_count || 0);
   }
 
   const scannedById = {};
-  if (scannedBuckets) {
+  if (scannedBuckets && scannedBuckets.length) {
     for (const b of scannedBuckets) {
       if (b && b.key) scannedById[String(b.key)] = Number(b.doc_count || 0);
     }
   }
 
-  const ids = Object.keys(soldById);
-  if (!ids.length) return out;
-
-  for (const id of ids) {
+  for (const [id, sold] of Object.entries(soldById)) {
     out.push({
-      name: id,
-      sold: soldById[id] || 0,
-      scanned: scannedById[id] || 0
-    });
-  }
-
-  return out;
-};
-
-  const aggs = data && data.aggregations ? data.aggregations : null;
-  if (!aggs) return out;
-
-  // 1) SOLD: aggregations.ticketCount.statistics.statistics.buckets
-  const soldBuckets =
-    getBuckets(aggs, ['ticketCount', 'statistics', 'statistics', 'buckets']) ||
-    getBuckets(aggs, ['ticketCount', 'statistics', 'buckets']) ||
-    getBuckets(aggs, ['ticketCount', 'buckets']);
-
-  // 2) SCANNED: cerchiamo un aggregation che contenga "scan"/"scanned"/"check" con buckets
-  let scannedBuckets = null;
-  for (const [k, v] of Object.entries(aggs)) {
-    const key = String(k).toLowerCase();
-    if (key.includes('scan') || key.includes('scanned') || key.includes('check') || key.includes('entry')) {
-      scannedBuckets =
-        getBuckets(v, ['statistics', 'statistics', 'buckets']) ||
-        getBuckets(v, ['statistics', 'buckets']) ||
-        getBuckets(v, ['buckets']);
-      if (scannedBuckets) break;
-    }
-  }
-
-  // Normalizziamo in map guid -> count
-  const soldById = {};
-  if (soldBuckets) {
-    for (const b of soldBuckets) {
-      if (b && b.key) soldById[String(b.key)] = Number(b.doc_count || 0);
-    }
-  }
-
-  const scannedById = {};
-  if (scannedBuckets) {
-    for (const b of scannedBuckets) {
-      if (b && b.key) scannedById[String(b.key)] = Number(b.doc_count || 0);
-    }
-  }
-
-  // Se non abbiamo nemmeno soldBuckets, non possiamo fare nulla
-  const ids = Object.keys(soldById);
-  if (!ids.length) return out;
-
-  // Nomi: per ora usiamo il GUID (poi lo mappiamo a Wave 1/2/Final)
-  for (const id of ids) {
-    out.push({
-      name: id,                 // per ora GUID
-      sold: soldById[id] || 0,
+      id,
+      sold,
       scanned: scannedById[id] || 0
     });
   }
@@ -278,73 +227,21 @@ function parseWeeztixStats(data) {
   return out;
 }
 
-  // Try common array shapes
-  const arrays = [
-    data?.ticket_types,
-    data?.tickets,
-    data?.ticketTypes,
-    data?.data?.ticket_types,
-    data?.data?.tickets
-  ].filter(Array.isArray);
-
-  for (const arr of arrays) {
-    for (const t of arr) {
-      push(
-        t?.name || t?.title || t?.key,
-        t?.sold_count ?? t?.sold ?? t?.count_sold ?? t?.total_sold ?? t?.soldCount,
-        t?.scanned_count ?? t?.scanned ?? t?.count_scanned ?? t?.total_scanned ?? t?.scannedCount
-      );
-    }
-    if (out.length) return out;
-  }
-
-  // Try aggregation buckets
-  const buckets =
-    data?.aggregations?.ticket_types?.buckets ||
-    data?.aggregations?.tickets?.buckets ||
-    data?.aggs?.ticket_types?.buckets ||
-    data?.aggs?.tickets?.buckets ||
-    data?.data?.aggregations?.ticket_types?.buckets ||
-    data?.data?.aggregations?.tickets?.buckets;
-
-  if (Array.isArray(buckets)) {
-    for (const b of buckets) {
-      const sold = b?.sold_count?.value ?? b?.sold?.value ?? b?.sold_count ?? b?.sold ?? b?.doc_count;
-      const scanned = b?.scanned_count?.value ?? b?.scanned?.value ?? b?.scanned_count ?? b?.scanned ?? 0;
-      push(b?.key, sold, scanned);
-    }
-    if (out.length) return out;
-  }
-
-  // Try object map
-  if (data?.ticket_types && typeof data.ticket_types === 'object' && !Array.isArray(data.ticket_types)) {
-    for (const [name, v] of Object.entries(data.ticket_types)) {
-      push(
-        name,
-        v?.sold_count ?? v?.sold ?? v?.count_sold ?? v?.total_sold,
-        v?.scanned_count ?? v?.scanned ?? v?.count_scanned ?? v?.total_scanned
-      );
-    }
-    if (out.length) return out;
-  }
-
-  return [];
-
-function waveLabel(name) {
-  const n = String(name || '').toLowerCase();
-  if (n.includes('wave 1') || n.includes('first') || n.includes('early')) return 'Wave 1';
-  if (n.includes('wave 2') || n.includes('second')) return 'Wave 2';
-  if (n.includes('wave 3') || n.includes('third')) return 'Wave 3';
-  if (n.includes('final') || n.includes('last')) return 'Final';
-  return 'Altra';
+/**
+ * Simple mapping of ticket-type GUID to wave names.
+ * For now returns the GUID itself. We'll hardcode mapping once you paste /biglietti output.
+ */
+function ticketLabel(id) {
+  // TODO: after first successful /biglietti, we map these IDs to "Wave 1/Wave 2/Final"
+  return id;
 }
 
-function groupByWave(stats, field) {
+function groupTotals(field) {
   const grouped = {};
   let total = 0;
-  for (const s of stats) {
-    const label = waveLabel(s.name);
-    const val = Number(s[field] || 0);
+  for (const t of weeztixTicketStats) {
+    const label = ticketLabel(t.id);
+    const val = Number(t[field] || 0);
     grouped[label] = (grouped[label] || 0) + val;
     total += val;
   }
@@ -363,12 +260,13 @@ async function fetchWeeztixStats() {
     const url = `https://api.weeztix.com/statistics/dashboard/${WEEZTIX_EVENT_GUID}`;
     const resp = await axios.get(url, {
       headers: { Authorization: `Bearer ${token}` },
-      timeout: 15000
+      timeout: 20000
     });
 
     weeztixLastRaw = resp.data ?? { _empty: true };
 
     const parsed = parseWeeztixStats(resp.data);
+
     if (!parsed.length) {
       weeztixLastError = 'Stats fetched but parsing returned empty';
       return;
@@ -378,7 +276,7 @@ async function fetchWeeztixStats() {
     weeztixLastOkAt = new Date().toISOString();
     weeztixLastError = null;
 
-    // Capacity alerts
+    // Capacity alerts based on scanned total
     if (MP_CAPACITY > 0 && alertSubscribers.size > 0) {
       const scannedTotal = weeztixTicketStats.reduce((sum, t) => sum + (Number(t.scanned) || 0), 0);
       const ratio = scannedTotal / MP_CAPACITY;
@@ -414,7 +312,7 @@ app.post('/webhook', async (req, res) => {
     const chatId = msg.chat.id;
     const text = (msg.text || '').trim();
 
-    // AUTH TEST
+    // Health debug
     if (text.startsWith('/auth_check')) {
       try {
         await refreshAccessToken();
@@ -426,52 +324,48 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Force poll now
     if (text.startsWith('/poll_now')) {
       await fetchWeeztixStats();
       await tgSend(chatId, `✅ Poll fatto.\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
       return res.sendStatus(200);
     }
 
-    // Debug raw
     if (text.startsWith('/debugweeztix_raw')) {
       const preview = weeztixLastRaw ? JSON.stringify(weeztixLastRaw, null, 2).slice(0, 3500) : '(vuoto)';
       await tgSend(chatId, `🧾 WEEZTIX RAW (trimmed)\n\n${preview}`);
       return res.sendStatus(200);
     }
 
-    // Debug summary
     if (text.startsWith('/debugweeztix')) {
       const sample = weeztixTicketStats.slice(0, 12)
-        .map(s => `• ${s.name} | sold=${s.sold} | scanned=${s.scanned}`)
+        .map(t => `• ${t.id} | sold=${t.sold} | scanned=${t.scanned}`)
         .join('\n');
 
       await tgSend(
         chatId,
-        `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}\n\nSample:\n${sample || '(vuoto)'}`
+        `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nTicket rows: ${weeztixTicketStats.length}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}\n\nSample:\n${sample || '(vuoto)'}`
       );
       return res.sendStatus(200);
     }
 
-    // Commands: tickets sold
+    // Commands
     if (text.startsWith('/biglietti')) {
       if (!weeztixTicketStats.length) {
         await tgSend(chatId, `🎟️ Nessun dato ancora.\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
         return res.sendStatus(200);
       }
-      const { grouped, total } = groupByWave(weeztixTicketStats, 'sold');
+      const { grouped, total } = groupTotals('sold');
       const lines = Object.entries(grouped).map(([k, v]) => `• ${k}: ${v}`).join('\n');
-      await tgSend(chatId, `🎟 BIGLIETTI VENDUTI\n\n${lines}\n\nTotale: ${total}\nAggiornato: ${weeztixLastOkAt}`);
+      await tgSend(chatId, `🎟 BIGLIETTI (da ticketCount)\n\n${lines}\n\nTotale: ${total}\nAggiornato: ${weeztixLastOkAt}`);
       return res.sendStatus(200);
     }
 
-    // Commands: scanned entries
     if (text.startsWith('/entrate')) {
       if (!weeztixTicketStats.length) {
         await tgSend(chatId, `🚪 Nessun dato ancora.\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
         return res.sendStatus(200);
       }
-      const { grouped, total } = groupByWave(weeztixTicketStats, 'scanned');
+      const { grouped, total } = groupTotals('scanned');
       const lines = Object.entries(grouped).map(([k, v]) => `• ${k}: ${v}`).join('\n');
 
       let capLine = '';
@@ -480,7 +374,12 @@ app.post('/webhook', async (req, res) => {
         capLine = `\nCapienza: ${pct}% (${total}/${MP_CAPACITY})`;
       }
 
-      await tgSend(chatId, `🚪 ENTRATE (SCANNER)\n\n${lines}\n\nTotale entrati: ${total}${capLine}\nAggiornato: ${weeztixLastOkAt}`);
+      // Important note if scans are missing
+      const note = total === 0
+        ? `\n\nℹ️ Nota: se vedi tutto 0, nel payload Weeztix non c’è (ancora) un’aggregazione “scan”.`
+        : '';
+
+      await tgSend(chatId, `🚪 ENTRATE (best effort)\n\n${lines}\n\nTotale entrati: ${total}${capLine}${note}\nAggiornato: ${weeztixLastOkAt}`);
       return res.sendStatus(200);
     }
 
@@ -490,13 +389,11 @@ app.post('/webhook', async (req, res) => {
       await tgSend(chatId, '🔔 Alert attivati. Ti avviso a 80% e 95% capienza.');
       return res.sendStatus(200);
     }
-
     if (text.startsWith('/alerts_off')) {
       alertSubscribers.delete(chatId);
       await tgSend(chatId, '🔕 Alert disattivati.');
       return res.sendStatus(200);
     }
-
     if (text.startsWith('/testalerts')) {
       alertSubscribers.add(chatId);
       await tgSend(chatId, '🧪 Test alerts: ok. Ti invio due messaggi di prova.');
