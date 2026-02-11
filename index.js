@@ -303,18 +303,33 @@ async function fetchWeeztixStats() {
 
     let resp;
 
-    try {
-      // Try with current access token (may be null/expired)
-      resp = await callApi();
-    } catch (e) {
-      if (e?.response?.status === 401) {
-        console.log('🔄 Weeztix API 401 → refreshing access token...');
-        await refreshAccessToken();
-        resp = await callApi(); // retry once
-      } else {
-        throw e;
-      }
-    }
+   try {
+  if (!WEEZTIX_ACCESS_TOKEN) {
+    console.log('🔄 No access token → refreshing...');
+    await refreshAccessToken();
+  }
+
+  resp = await callApi();
+
+} catch (e) {
+
+  const status = e?.response?.status;
+  const msg = e?.response?.data?.error_description || '';
+
+  // Refresh on:
+  // - 401 unauthorized
+  // - 400 malformed JWT
+  if (
+    status === 401 ||
+    (status === 400 && msg.includes('JWT'))
+  ) {
+    console.log('🔄 Access token invalid → refreshing...');
+    await refreshAccessToken();
+    resp = await callApi(); // retry once
+  } else {
+    throw e;
+  }
+}
 
     weeztixLastRaw = resp.data ?? { _empty: true };
 
