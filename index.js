@@ -144,6 +144,9 @@ app.get('/weeztix/callback', async (req, res) => {
 // -------------------- Weeztix OAuth: refresh access token --------------------
 let WEEZTIX_ACCESS_TOKEN = null;
 let WEEZTIX_ACCESS_EXPIRES_AT = 0;
+// 🔁 refresh token runtime + lock
+let WEEZTIX_REFRESH_TOKEN_RUNTIME = process.env.WEEZTIX_REFRESH_TOKEN || null;
+let REFRESH_IN_FLIGHT = null;
 
 async function refreshAccessToken() {
   const now = Date.now();
@@ -152,26 +155,48 @@ async function refreshAccessToken() {
     return WEEZTIX_ACCESS_TOKEN;
   }
 
-  const clientId = process.env.OAUTH_CLIENT_ID;
-  const clientSecret = process.env.OAUTH_CLIENT_SECRET;
-  const refreshToken = process.env.WEEZTIX_REFRESH_TOKEN;
+  if (REFRESH_IN_FLIGHT) return REFRESH_IN_FLIGHT;
 
-  if (!clientId || !clientSecret) throw new Error('Missing OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET');
-  if (!refreshToken) throw new Error('Missing WEEZTIX_REFRESH_TOKEN');
+  REFRESH_IN_FLIGHT = (async () => {
+    const clientId = process.env.OAUTH_CLIENT_ID;
+    const clientSecret = process.env.OAUTH_CLIENT_SECRET;
+    const refreshToken = WEEZTIX_REFRESH_TOKEN_RUNTIME;
 
-  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    if (!clientId || !clientSecret) throw new Error('Missing OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET');
+    if (!refreshToken) throw new Error('Missing WEEZTIX_REFRESH_TOKEN');
 
-  const params = new URLSearchParams();
-  params.append('grant_type', 'refresh_token');
-  params.append('refresh_token', refreshToken);
+    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
 
-  const r = await axios.post('https://auth.weeztix.com/tokens', params, {
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Authorization': `Basic ${basicAuth}`
-    },
-    timeout: 15000
-  });
+    const params = new URLSearchParams();
+    params.append('grant_type', 'refresh_token');
+    params.append('refresh_token', refreshToken);
+
+    const r = await axios.post('https://auth.weeztix.com/tokens', params, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${basicAuth}`
+      },
+      timeout: 15000
+    });
+
+    WEEZTIX_ACCESS_TOKEN = r.data.access_token;
+    WEEZTIX_ACCESS_EXPIRES_AT = now + (Number(r.data.expires_in || 0) * 1000);
+
+    // ✅ rotation: se Weeztix fornisce un refresh_token nuovo, usalo da subito
+    if (r.data.refresh_token && typeof r.data.refresh_token === 'string') {
+      WEEZTIX_REFRESH_TOKEN_RUNTIME = r.data.refresh_token;
+      console.log('🔁 Weeztix rotated refresh_token. NEW refresh_token:', r.data.refresh_token);
+    }
+
+    return WEEZTIX_ACCESS_TOKEN;
+  })();
+
+  try {
+    return await REFRESH_IN_FLIGHT;
+  } finally {
+    REFRESH_IN_FLIGHT = null;
+  }
+}
 
   WEEZTIX_ACCESS_TOKEN = r.data.access_token;
   WEEZTIX_ACCESS_EXPIRES_AT = now + (Number(r.data.expires_in || 0) * 1000);
