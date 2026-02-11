@@ -1,6 +1,6 @@
 /**
  * MP Telegram Bot + Weeztix OAuth + Stats Polling + Trend + Event Night
- * Includes FIX for refresh-token rotation + refresh concurrency lock.
+ * STABLE VERSION: polling ON, refresh ONLY on Weeztix API 401.
  *
  * Render ENV required:
  * BOT_TOKEN
@@ -15,6 +15,7 @@
  *
  * Optional:
  * WEEZTIX_POLL_SECONDS (default 60)
+ * ADMIN_CHAT_ID (optional; if set, bot pings you when refresh token rotates)
  */
 
 const express = require('express');
@@ -29,10 +30,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 async function tgSend(chatId, text) {
-  await axios.post(`${TELEGRAM_API}/sendMessage`, {
-    chat_id: chatId,
-    text
-  });
+  await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text });
 }
 
 // -------------------- MP config --------------------
@@ -52,7 +50,7 @@ async function broadcastAlert(message) {
   for (const id of ids) {
     try {
       await tgSend(id, message);
-    } catch (e) {
+    } catch {
       alertSubscribers.delete(id);
     }
   }
@@ -142,23 +140,17 @@ app.get('/weeztix/callback', async (req, res) => {
   }
 });
 
-// -------------------- Weeztix OAuth: refresh access token --------------------
+// -------------------- Weeztix tokens (stable mode) --------------------
+// Access token cached in memory (no proactive refresh)
 let WEEZTIX_ACCESS_TOKEN = null;
-let WEEZTIX_ACCESS_EXPIRES_AT = 0;
 
-// 🔁 runtime refresh token (supports rotation) + lock to avoid concurrent refresh
+// Refresh token runtime (supports rotation)
 let WEEZTIX_REFRESH_TOKEN_RUNTIME = process.env.WEEZTIX_REFRESH_TOKEN || null;
+
+// Refresh lock
 let REFRESH_IN_FLIGHT = null;
 
 async function refreshAccessToken() {
-  const now = Date.now();
-
-  // still valid
-  if (WEEZTIX_ACCESS_TOKEN && now < WEEZTIX_ACCESS_EXPIRES_AT - 60_000) {
-    return WEEZTIX_ACCESS_TOKEN;
-  }
-
-  // lock: if refresh is already running, await it
   if (REFRESH_IN_FLIGHT) return REFRESH_IN_FLIGHT;
 
   REFRESH_IN_FLIGHT = (async () => {
@@ -167,7 +159,6 @@ async function refreshAccessToken() {
 
     if (!clientId || !clientSecret) throw new Error('Missing OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET');
 
-    // always read from runtime (may have been rotated)
     const refreshToken = WEEZTIX_REFRESH_TOKEN_RUNTIME || process.env.WEEZTIX_REFRESH_TOKEN;
     if (!refreshToken) throw new Error('Missing WEEZTIX_REFRESH_TOKEN');
 
@@ -185,14 +176,25 @@ async function refreshAccessToken() {
       timeout: 15000
     });
 
-    // access token
     WEEZTIX_ACCESS_TOKEN = r.data.access_token;
-    WEEZTIX_ACCESS_EXPIRES_AT = now + (Number(r.data.expires_in || 0) * 1000);
 
-    // refresh token rotation (if provided)
     if (r.data.refresh_token && typeof r.data.refresh_token === 'string') {
       WEEZTIX_REFRESH_TOKEN_RUNTIME = r.data.refresh_token;
       console.log('🔁 Weeztix rotated refresh_token. NEW refresh_token:', r.data.refresh_token);
+
+      const adminId = process.env.ADMIN_CHAT_ID;
+      if (adminId) {
+        try {
+          await tgSend(
+            adminId,
+            '🔁 Weeztix ha ruotato il refresh token.\n\n' +
+              '⚠️ Aggiorna Render ENV: WEEZTIX_REFRESH_TOKEN\n' +
+              'Lo trovi nei Render logs: "NEW refresh_token"'
+          );
+        } catch (err) {
+          console.log('Admin notify failed:', err?.message || err);
+        }
+      }
     }
 
     return WEEZTIX_ACCESS_TOKEN;
@@ -213,18 +215,12 @@ let weeztixLastOkAt = null;
 let weeztixLastError = null;
 let weeztixLastRaw = null;
 
-// normalized stats: [{ id, sold, scanned }]
-let weeztixTicketStats = [];
+let weeztixTicketStats = []; // [{ id, sold, scanned }]
 
 // ---- Time series for trend/night ----
 const statsSeries = []; // [{ ts, soldTotal, scannedTotal }]
 const SERIES_KEEP_MS = 48 * 60 * 60 * 1000; // 48h
 
-/**
- * Parser tailored to your payload:
- * aggregations.ticketCount.statistics.statistics.buckets => [{key: <ticketTypeGuid>, doc_count: <sold>}]
- * For scanned, best-effort discovery from aggs containing scan/check/entry.
- */
 function parseWeeztixStats(data) {
   const out = [];
   const aggs = data && data.aggregations ? data.aggregations : null;
@@ -271,11 +267,7 @@ function parseWeeztixStats(data) {
   }
 
   for (const [id, sold] of Object.entries(soldById)) {
-    out.push({
-      id,
-      sold,
-      scanned: scannedById[id] || 0
-    });
+    out.push({ id, sold, scanned: scannedById[id] || 0 });
   }
 
   return out;
@@ -300,13 +292,29 @@ async function fetchWeeztixStats() {
       return;
     }
 
-    const token = await refreshAccessToken();
-
     const url = `https://api.weeztix.com/statistics/dashboard/${WEEZTIX_EVENT_GUID}`;
-    const resp = await axios.get(url, {
-      headers: { Authorization: `Bearer ${token}` },
-      timeout: 20000
-    });
+
+    const callApi = async () => {
+      return axios.get(url, {
+        headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
+        timeout: 20000
+      });
+    };
+
+    let resp;
+
+    try {
+      // Try with current access token (may be null/expired)
+      resp = await callApi();
+    } catch (e) {
+      if (e?.response?.status === 401) {
+        console.log('🔄 Weeztix API 401 → refreshing access token...');
+        await refreshAccessToken();
+        resp = await callApi(); // retry once
+      } else {
+        throw e;
+      }
+    }
 
     weeztixLastRaw = resp.data ?? { _empty: true };
 
@@ -323,49 +331,26 @@ async function fetchWeeztixStats() {
     const soldTotalNow = weeztixTicketStats.reduce((sum, t) => sum + (Number(t.sold) || 0), 0);
     const scannedTotalNow = weeztixTicketStats.reduce((sum, t) => sum + (Number(t.scanned) || 0), 0);
 
-    // time series
+    // time series store + cleanup
     statsSeries.push({ ts: Date.now(), soldTotal: soldTotalNow, scannedTotal: scannedTotalNow });
     const cutoff = Date.now() - SERIES_KEEP_MS;
     while (statsSeries.length && statsSeries[0].ts < cutoff) statsSeries.shift();
 
-    // sellout alerts
+    // Sellout alerts (sold-based)
     if (MP_CAPACITY > 0 && alertSubscribers.size > 0) {
       const pct = soldTotalNow / MP_CAPACITY;
-
-      if (pct >= 0.80 && !selloutAlerts.p80) {
-        selloutAlerts.p80 = true;
-        await broadcastAlert(`🔥 80% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}`);
-      }
-      if (pct >= 0.90 && !selloutAlerts.p90) {
-        selloutAlerts.p90 = true;
-        await broadcastAlert(`🚀 90% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}`);
-      }
-      if (pct >= 0.95 && !selloutAlerts.p95) {
-        selloutAlerts.p95 = true;
-        await broadcastAlert(`🚨 95% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}\nValuta chiusura biglietti.`);
-      }
-      if (pct >= 1.00 && !selloutAlerts.p100) {
-        selloutAlerts.p100 = true;
-        await broadcastAlert(`🟥 SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}\nChiudi ticketing.`);
-      }
+      if (pct >= 0.80 && !selloutAlerts.p80) { selloutAlerts.p80 = true; await broadcastAlert(`🔥 80% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}`); }
+      if (pct >= 0.90 && !selloutAlerts.p90) { selloutAlerts.p90 = true; await broadcastAlert(`🚀 90% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}`); }
+      if (pct >= 0.95 && !selloutAlerts.p95) { selloutAlerts.p95 = true; await broadcastAlert(`🚨 95% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}\nValuta chiusura biglietti.`); }
+      if (pct >= 1.00 && !selloutAlerts.p100) { selloutAlerts.p100 = true; await broadcastAlert(`🟥 SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}\nChiudi ticketing.`); }
     }
 
-    // door alerts (only if scanned exists)
+    // Door alerts (scanned-based) only if scanned exists
     if (MP_CAPACITY > 0 && alertSubscribers.size > 0 && scannedTotalNow > 0) {
       const pct = scannedTotalNow / MP_CAPACITY;
-
-      if (pct >= 0.70 && !doorAlerts.p70) {
-        doorAlerts.p70 = true;
-        await broadcastAlert(`🚪 Porta: 70% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}`);
-      }
-      if (pct >= 0.85 && !doorAlerts.p85) {
-        doorAlerts.p85 = true;
-        await broadcastAlert(`⚠️ Porta: 85% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nOcchio fila / sicurezza.`);
-      }
-      if (pct >= 0.95 && !doorAlerts.p95) {
-        doorAlerts.p95 = true;
-        await broadcastAlert(`🚨 Porta: 95% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nValuta STOP ingressi.`);
-      }
+      if (pct >= 0.70 && !doorAlerts.p70) { doorAlerts.p70 = true; await broadcastAlert(`🚪 Porta: 70% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}`); }
+      if (pct >= 0.85 && !doorAlerts.p85) { doorAlerts.p85 = true; await broadcastAlert(`⚠️ Porta: 85% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nOcchio fila / sicurezza.`); }
+      if (pct >= 0.95 && !doorAlerts.p95) { doorAlerts.p95 = true; await broadcastAlert(`🚨 Porta: 95% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nValuta STOP ingressi.`); }
     }
   } catch (e) {
     if (e?.response?.data) {
@@ -378,7 +363,6 @@ async function fetchWeeztixStats() {
 
 // Start polling
 setInterval(fetchWeeztixStats, WEEZTIX_POLL_SECONDS * 1000);
-fetchWeeztixStats();
 
 // -------------------- Telegram webhook --------------------
 app.post('/webhook', async (req, res) => {
@@ -389,8 +373,15 @@ app.post('/webhook', async (req, res) => {
     const chatId = msg.chat.id;
     const text = (msg.text || '').trim();
 
+    // handy: get your chat id (for ADMIN_CHAT_ID)
+    if (text === '/whoami') {
+      await tgSend(chatId, `🆔 Il tuo chat ID è: ${chatId}`);
+      return res.sendStatus(200);
+    }
+
     if (text.startsWith('/auth_check')) {
       try {
+        // Force a token refresh to validate credentials
         await refreshAccessToken();
         await tgSend(chatId, '✅ OAuth OK: access token ottenuto.');
       } catch (e) {
@@ -418,21 +409,6 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (text.startsWith('/testalerts')) {
-      alertSubscribers.add(chatId);
-      await tgSend(chatId, '🧪 Test alerts: ok. Ti invio messaggi di prova.');
-      await broadcastAlert('🔥 [TEST] 80% SOLD OUT\nVenduti: 320/400');
-      await broadcastAlert('🚨 [TEST] 95% SOLD OUT\nVenduti: 380/400');
-      await broadcastAlert('🚪 [TEST] Porta 85%\nEntrati: 340/400');
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/debugweeztix_raw')) {
-      const preview = weeztixLastRaw ? JSON.stringify(weeztixLastRaw, null, 2).slice(0, 3500) : '(vuoto)';
-      await tgSend(chatId, `🧾 WEEZTIX RAW (trimmed)\n\n${preview}`);
-      return res.sendStatus(200);
-    }
-
     if (text.startsWith('/debugweeztix')) {
       const sample = weeztixTicketStats.slice(0, 12)
         .map(t => `• ${ticketLabel(t.id)} (${t.id.slice(0, 8)}…) | sold=${t.sold} | scanned=${t.scanned}`)
@@ -440,8 +416,15 @@ app.post('/webhook', async (req, res) => {
 
       await tgSend(
         chatId,
-        `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nTicket rows: ${weeztixTicketStats.length}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}\n\nSample:\n${sample || '(vuoto)'}`
+        `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nTicket rows: ${weeztixTicketStats.length}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}`
+        + `\n\nSample:\n${sample || '(vuoto)'}`
       );
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/debugweeztix_raw')) {
+      const preview = weeztixLastRaw ? JSON.stringify(weeztixLastRaw, null, 2).slice(0, 3500) : '(vuoto)';
+      await tgSend(chatId, `🧾 WEEZTIX RAW (trimmed)\n\n${preview}`);
       return res.sendStatus(200);
     }
 
@@ -473,29 +456,6 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (text.startsWith('/entrate')) {
-      if (!weeztixTicketStats.length) {
-        await tgSend(chatId, `🚪 Nessun dato ancora.\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
-        return res.sendStatus(200);
-      }
-
-      const { grouped, total } = groupTotals('scanned');
-      const lines = Object.entries(grouped).map(([k, v]) => `• ${k}: ${v}`).join('\n');
-
-      let capLine = '';
-      if (MP_CAPACITY > 0) {
-        const pct = Math.round((total / MP_CAPACITY) * 100);
-        capLine = `\nCapienza (scanned): ${pct}% (${total}/${MP_CAPACITY})`;
-      }
-
-      const note = total === 0
-        ? `\n\nℹ️ Nota: se vedi 0, nel payload Weeztix non arriva ancora l’aggregazione “scanned”.`
-        : '';
-
-      await tgSend(chatId, `🚪 ENTRATE (SCANNER)\n\n${lines}\n\nTotale entrati: ${total}${capLine}${note}\nAggiornato: ${weeztixLastOkAt}`);
-      return res.sendStatus(200);
-    }
-
     if (text.startsWith('/trend')) {
       if (statsSeries.length < 2) {
         await tgSend(chatId, '📈 Trend: serve qualche minuto di dati. Fai /poll_now e riprova tra 2–3 minuti.');
@@ -507,9 +467,7 @@ app.post('/webhook', async (req, res) => {
 
       const findClosest = (msAgo) => {
         const target = now - msAgo;
-        for (const p of statsSeries) {
-          if (p.ts >= target) return p;
-        }
+        for (const p of statsSeries) if (p.ts >= target) return p;
         return statsSeries[0];
       };
 
@@ -527,16 +485,11 @@ app.post('/webhook', async (req, res) => {
         const remaining = Math.max(0, MP_CAPACITY - soldNow);
         const pace = delta1h > 0 ? delta1h : (avgPerHour24 > 0 ? avgPerHour24 : 0);
 
-        if (remaining === 0) {
-          etaLine = '🟥 SOLD OUT';
-        } else if (pace > 0) {
-          const hoursToSoldOut = remaining / pace;
-          const etaTs = now + hoursToSoldOut * 60 * 60 * 1000;
-          const eta = new Date(etaTs);
-          etaLine = `⏳ ETA sold-out: ~${eta.toLocaleString('it-BE', { timeZone: 'Europe/Brussels' })} (pace ~${pace.toFixed(1)}/h)`;
-        } else {
-          etaLine = '⏳ ETA sold-out: n/d (pace ~0)';
-        }
+        if (remaining === 0) etaLine = '🟥 SOLD OUT';
+        else if (pace > 0) {
+          const etaTs = now + (remaining / pace) * 60 * 60 * 1000;
+          etaLine = `⏳ ETA sold-out: ~${new Date(etaTs).toLocaleString('it-BE', { timeZone: 'Europe/Brussels' })} (pace ~${pace.toFixed(1)}/h)`;
+        } else etaLine = '⏳ ETA sold-out: n/d (pace ~0)';
       }
 
       await tgSend(
@@ -561,9 +514,7 @@ app.post('/webhook', async (req, res) => {
 
       const target15 = now - 15 * 60 * 1000;
       let p15 = null;
-      for (const p of statsSeries) {
-        if (p.ts >= target15) { p15 = p; break; }
-      }
+      for (const p of statsSeries) { if (p.ts >= target15) { p15 = p; break; } }
       p15 = p15 || statsSeries[0];
 
       const scannedNow = last.scannedTotal || 0;
@@ -576,27 +527,14 @@ app.post('/webhook', async (req, res) => {
       const used = useProxy ? soldNow : scannedNow;
 
       let capLine = 'Capienza: n/d';
-      if (MP_CAPACITY > 0) {
-        const pct = Math.round((used / MP_CAPACITY) * 100);
-        capLine = `Capienza: ${pct}% (${used}/${MP_CAPACITY})`;
-      }
+      if (MP_CAPACITY > 0) capLine = `Capienza: ${Math.round((used / MP_CAPACITY) * 100)}% (${used}/${MP_CAPACITY})`;
 
-      const proxyNote = useProxy
-        ? '\nℹ️ Nota: non vedo “scanned” da Weeztix → sto usando i venduti come proxy (non ideale per la porta).'
-        : '';
-
-      const paceLine = useProxy
-        ? '⚡ Ritmo ingressi: n/d (scanned non disponibile)'
-        : `⚡ Ritmo ingressi (ult 15m): ${delta15} (+${perHour}/h)`;
+      const paceLine = useProxy ? '⚡ Ritmo ingressi: n/d (scanned non disponibile)' : `⚡ Ritmo ingressi (ult 15m): ${delta15} (+${perHour}/h)`;
+      const proxyNote = useProxy ? '\nℹ️ Nota: non vedo “scanned” da Weeztix → uso i venduti come proxy (non ideale per la porta).' : '';
 
       await tgSend(
         chatId,
-        `🌙 EVENT NIGHT\n` +
-        `🚪 Entrati: ${useProxy ? 'n/d' : scannedNow}\n` +
-        `🎟 Venduti: ${soldNow}\n` +
-        `${paceLine}\n` +
-        `📊 ${capLine}` +
-        proxyNote
+        `🌙 EVENT NIGHT\n🚪 Entrati: ${useProxy ? 'n/d' : scannedNow}\n🎟 Venduti: ${soldNow}\n${paceLine}\n📊 ${capLine}${proxyNote}`
       );
       return res.sendStatus(200);
     }
