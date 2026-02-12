@@ -27,14 +27,24 @@ app.use(express.json());
 
 // -------------------- Telegram --------------------
 const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+  console.error('Missing BOT_TOKEN in environment');
+  process.exit(1);
+}
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 async function tgSend(chatId, text) {
-  await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text });
+  try {
+    await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text }, { timeout: 15000 });
+  } catch (e) {
+    console.error('Telegram send error:', e?.response?.data || e.message || e);
+    throw e;
+  }
 }
 
 // -------------------- MP config --------------------
 const MP_CAPACITY = Number(process.env.MP_CAPACITY || 0);
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || null;
 
 // Organizer opt-in alerts (DM)
 const alertSubscribers = new Set();
@@ -153,6 +163,7 @@ let REFRESH_IN_FLIGHT = null;
 async function refreshAccessToken() {
   if (REFRESH_IN_FLIGHT) return REFRESH_IN_FLIGHT;
 
+  // FIX: close this IIFE properly, then await it with try/finally below
   REFRESH_IN_FLIGHT = (async () => {
     const clientId = process.env.OAUTH_CLIENT_ID;
     const clientSecret = process.env.OAUTH_CLIENT_SECRET;
@@ -169,31 +180,38 @@ async function refreshAccessToken() {
     params.append('refresh_token', refreshToken);
 
     const r = await axios.post('https://auth.weeztix.com/tokens', params, {
-  headers: {
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Authorization': `Basic ${basicAuth}`
-  },
-  timeout: 15000
-});
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${basicAuth}`
+      },
+      timeout: 15000
+    });
 
-const at = r.data?.access_token;
+    const at = r.data?.access_token;
 
-// 🔎 DEBUG: controlliamo che sia un vero JWT (deve avere 2 punti)
-const dotCount = (typeof at === 'string') ? (at.match(/\./g) || []).length : -1;
-console.log('🧪 access_token dots:', dotCount, 'type:', typeof at, 'preview:', (at || '').slice(0, 25));
+    // 🔎 DEBUG: ensure it's a JWT (must have 2 dots)
+    const dotCount = (typeof at === 'string') ? (at.match(/\./g) || []).length : -1;
+    console.log('🧪 access_token dots:', dotCount, 'type:', typeof at, 'preview:', (at || '').slice(0, 25));
 
-if (!at || typeof at !== 'string' || dotCount < 2) {
-  throw new Error('Refresh returned non-JWT access_token (expected 2 dots)');
-}
+    if (!at || typeof at !== 'string' || dotCount < 2) {
+      throw new Error('Refresh returned non-JWT access_token (expected 2 dots)');
+    }
 
-WEEZTIX_ACCESS_TOKEN = at;
+    WEEZTIX_ACCESS_TOKEN = at;
 
-if (r.data.refresh_token && typeof r.data.refresh_token === 'string') {
-  WEEZTIX_REFRESH_TOKEN_RUNTIME = r.data.refresh_token;
-  console.log('🔁 Weeztix rotated refresh_token. NEW refresh_token:', r.data.refresh_token);
-}
+    if (r.data.refresh_token && typeof r.data.refresh_token === 'string') {
+      WEEZTIX_REFRESH_TOKEN_RUNTIME = r.data.refresh_token;
+      console.log('🔁 Weeztix rotated refresh_token. NEW refresh_token:', r.data.refresh_token);
 
-return WEEZTIX_ACCESS_TOKEN;
+      // Optional admin ping on rotation
+      if (ADMIN_CHAT_ID) {
+        try { await tgSend(ADMIN_CHAT_ID, '🔁 Weeztix: refresh_token has rotated. Update env if you persist it.'); }
+        catch (_) { /* ignore */ }
+      }
+    }
+
+    return WEEZTIX_ACCESS_TOKEN;
+  })();
 
   try {
     return await REFRESH_IN_FLIGHT;
@@ -298,33 +316,30 @@ async function fetchWeeztixStats() {
 
     let resp;
 
-   try {
-  if (!WEEZTIX_ACCESS_TOKEN) {
-    console.log('🔄 No access token → refreshing...');
-    await refreshAccessToken();
-  }
+    try {
+      if (!WEEZTIX_ACCESS_TOKEN) {
+        console.log('🔄 No access token → refreshing...');
+        await refreshAccessToken();
+      }
+      resp = await callApi();
+    } catch (e) {
+      const status = e?.response?.status;
+      const msg = e?.response?.data?.error_description || '';
 
-  resp = await callApi();
-
-} catch (e) {
-
-  const status = e?.response?.status;
-  const msg = e?.response?.data?.error_description || '';
-
-  // Refresh on:
-  // - 401 unauthorized
-  // - 400 malformed JWT
-  if (
-    status === 401 ||
-    (status === 400 && msg.includes('JWT'))
-  ) {
-    console.log('🔄 Access token invalid → refreshing...');
-    await refreshAccessToken();
-    resp = await callApi(); // retry once
-  } else {
-    throw e;
-  }
-}
+      // Refresh on:
+      // - 401 unauthorized
+      // - 400 malformed JWT
+      if (
+        status === 401 ||
+        (status === 400 && msg.includes('JWT'))
+      ) {
+        console.log('🔄 Access token invalid → refreshing...');
+        await refreshAccessToken();
+        resp = await callApi(); // retry once
+      } else {
+        throw e;
+      }
+    }
 
     weeztixLastRaw = resp.data ?? { _empty: true };
 
@@ -561,4 +576,4 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Bot live'));
+app.listen(PORT, () => console.log('Bot live on port', PORT));
