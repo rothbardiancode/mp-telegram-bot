@@ -14,7 +14,7 @@
  * WEEZTIX_REFRESH_TOKEN   (used only as seed; thereafter Redis is source of truth)
  *
  * Optional:
- * WEEZTIX_POLL_SECONDS (default 60)
+ * WEEZTIX_POLL_SECONDS (default 90)
  * ADMIN_CHAT_ID (optional; if set, bot pings you when refresh token rotates)
  *
  * Redis (Upstash REST):
@@ -43,6 +43,36 @@ async function tgSend(chatId, text) {
   } catch (e) {
     console.error('Telegram send error:', e?.response?.data || e.message || e);
     throw e;
+  }
+}
+
+// ----- Generic retry helper (network/timeout safe) -----
+// (NEW) Retries timeouts/network errors with exponential backoff
+async function withRetry(fn, {
+  retries = 2,
+  initialDelayMs = 800,
+  factor = 2,
+  shouldRetry = (err) => {
+    const status = err?.response?.status;
+    const code = err?.code;
+    // Retry on timeouts and network errors; avoid retrying on 4xx except 429
+    if (code === 'ECONNABORTED') return true; // axios timeout
+    if (!status) return true; // likely network/DNS
+    if (status === 429) return true; // rate limit
+    return false;
+  }
+} = {}) {
+  let attempt = 0;
+  let delay = initialDelayMs;
+  while (true) {
+    try {
+      return await fn();
+    } catch (e) {
+      attempt++;
+      if (attempt > retries || !shouldRetry(e)) throw e;
+      await new Promise(r => setTimeout(r, delay));
+      delay *= factor;
+    }
   }
 }
 
@@ -88,7 +118,6 @@ async function redisGet(key) {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
       timeout: 10000
     });
-    // r.data = { result: string|null }
     return typeof r.data?.result === 'string' ? r.data.result : null;
   } catch (e) {
     console.error('Redis GET error:', e?.response?.data || e.message || e);
@@ -100,7 +129,6 @@ async function redisSet(key, value) {
   if (!redisAvailable()) return;
   try {
     const url = `${REDIS_URL}/set/${encodeURIComponent(key)}`;
-    // Upstash accepts raw body as value for /set/{key}
     await axios.post(url, value, {
       headers: {
         Authorization: `Bearer ${REDIS_TOKEN}`,
@@ -300,7 +328,8 @@ async function refreshAccessToken() {
 
 // -------------------- Weeztix stats polling --------------------
 const WEEZTIX_EVENT_GUID = process.env.WEEZTIX_EVENT_GUID;
-const WEEZTIX_POLL_SECONDS = Number(process.env.WEEZTIX_POLL_SECONDS || 60);
+// (CHANGED) Default poll seconds 60 -> 90
+const WEEZTIX_POLL_SECONDS = Number(process.env.WEEZTIX_POLL_SECONDS || 90);
 
 let weeztixLastOkAt = null;
 let weeztixLastError = null;
@@ -388,7 +417,8 @@ async function fetchWeeztixStats() {
     const callApi = async () => {
       return axios.get(url, {
         headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
-        timeout: 20000
+        // (CHANGED) Timeout 20000 -> 30000
+        timeout: 30000
       });
     };
 
@@ -399,7 +429,8 @@ async function fetchWeeztixStats() {
         console.log('🔄 No access token → refreshing...');
         await refreshAccessToken();
       }
-      resp = await callApi();
+      // (NEW) Add retry for transient timeouts/network errors
+      resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
     } catch (e) {
       const status = e?.response?.status;
       const msg = e?.response?.data?.error_description || '';
@@ -413,7 +444,8 @@ async function fetchWeeztixStats() {
       ) {
         console.log('🔄 Access token invalid → refreshing...');
         await refreshAccessToken();
-        resp = await callApi(); // retry once
+        // (NEW) Retry with backoff after refresh as well
+        resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
       } else {
         throw e;
       }
@@ -456,8 +488,15 @@ async function fetchWeeztixStats() {
       if (pct >= 0.95 && !doorAlerts.p95) { doorAlerts.p95 = true; await broadcastAlert(`🚨 Porta: 95% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nValuta STOP ingressi.`); }
     }
   } catch (e) {
-    if (e?.response?.data) {
-      weeztixLastError = `HTTP ${e.response.status}: ${JSON.stringify(e.response.data).slice(0, 800)}`;
+    // (CHANGED) Clearer timeout logging
+    const code = e?.code;
+    const status = e?.response?.status;
+    const dataStr = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 800) : '';
+    if (code === 'ECONNABORTED') {
+      weeztixLastError = `Timeout: stats call exceeded ${30000}ms`;
+      console.error('Weeztix stats timeout (axios ECONNABORTED).');
+    } else if (status) {
+      weeztixLastError = `HTTP ${status}: ${dataStr || '(no body)'}`;
     } else {
       weeztixLastError = e?.message || String(e);
     }
