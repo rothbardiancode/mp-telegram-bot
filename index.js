@@ -10,12 +10,16 @@
  * WEEZTIX_EVENT_GUID
  * MP_CAPACITY             (e.g. 400)
  *
- * After connecting:
- * WEEZTIX_REFRESH_TOKEN
+ * After connecting (first OAuth exchange):
+ * WEEZTIX_REFRESH_TOKEN   (used only as seed; thereafter Redis is source of truth)
  *
  * Optional:
  * WEEZTIX_POLL_SECONDS (default 60)
  * ADMIN_CHAT_ID (optional; if set, bot pings you when refresh token rotates)
+ *
+ * Redis (Upstash REST):
+ * REDIS_URL
+ * REDIS_TOKEN
  */
 
 const express = require('express');
@@ -63,6 +67,49 @@ async function broadcastAlert(message) {
     } catch {
       alertSubscribers.delete(id);
     }
+  }
+}
+
+// -------------------- Redis (Upstash REST) --------------------
+const REDIS_URL = process.env.REDIS_URL || '';
+const REDIS_TOKEN = process.env.REDIS_TOKEN || '';
+
+function redisAvailable() {
+  return Boolean(REDIS_URL && REDIS_TOKEN);
+}
+
+// Simple Upstash REST helpers.
+// Docs: https://docs.upstash.com/redis/features/restapi
+async function redisGet(key) {
+  if (!redisAvailable()) return null;
+  try {
+    const url = `${REDIS_URL}/get/${encodeURIComponent(key)}`;
+    const r = await axios.post(url, null, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+      timeout: 10000
+    });
+    // r.data = { result: string|null }
+    return typeof r.data?.result === 'string' ? r.data.result : null;
+  } catch (e) {
+    console.error('Redis GET error:', e?.response?.data || e.message || e);
+    return null;
+  }
+}
+
+async function redisSet(key, value) {
+  if (!redisAvailable()) return;
+  try {
+    const url = `${REDIS_URL}/set/${encodeURIComponent(key)}`;
+    // Upstash accepts raw body as value for /set/{key}
+    await axios.post(url, value, {
+      headers: {
+        Authorization: `Bearer ${REDIS_TOKEN}`,
+        'Content-Type': 'text/plain'
+      },
+      timeout: 10000
+    });
+  } catch (e) {
+    console.error('Redis SET error:', e?.response?.data || e.message || e);
   }
 }
 
@@ -141,12 +188,23 @@ app.get('/weeztix/callback', async (req, res) => {
       timeout: 15000
     });
 
-    console.log('WEEZTIX TOKEN RESPONSE:', r.data); // copy refresh_token to env
+    console.log('WEEZTIX TOKEN RESPONSE:', {
+      has_access_token: !!r.data?.access_token,
+      has_refresh_token: !!r.data?.refresh_token
+    });
 
-    return res.send('✅ Weeztix connected. Check Render logs and set WEEZTIX_REFRESH_TOKEN in env.');
+    // If we receive a refresh_token here, seed Redis immediately.
+    if (r.data?.refresh_token && typeof r.data.refresh_token === 'string') {
+      try {
+        await redisSet('weeztix_refresh_token', r.data.refresh_token);
+        console.log('🔑 Saved initial refresh_token to Redis');
+      } catch (_) {}
+    }
+
+    return res.send('✅ Weeztix connected. If needed, check logs. Bot will persist refresh rotations to Redis automatically.');
   } catch (e) {
     console.error('Callback error:', e?.response?.data || e.message || e);
-    return res.status(500).send('Token exchange failed. Check Render logs.');
+    return res.status(500).send('Token exchange failed. Check logs.');
   }
 });
 
@@ -154,24 +212,44 @@ app.get('/weeztix/callback', async (req, res) => {
 // Access token cached in memory (no proactive refresh)
 let WEEZTIX_ACCESS_TOKEN = null;
 
-// Refresh token runtime (supports rotation)
-let WEEZTIX_REFRESH_TOKEN_RUNTIME = process.env.WEEZTIX_REFRESH_TOKEN || null;
+// Refresh token runtime (supports rotation) — Redis is the source of truth
+let WEEZTIX_REFRESH_TOKEN_RUNTIME = null;
 
-// Refresh lock
+// On startup, load from Redis; if missing, seed from ENV then persist.
+(async () => {
+  try {
+    const fromRedis = await redisGet('weeztix_refresh_token');
+    if (fromRedis) {
+      WEEZTIX_REFRESH_TOKEN_RUNTIME = fromRedis;
+      console.log('🔑 Loaded refresh token from Redis');
+    } else if (process.env.WEEZTIX_REFRESH_TOKEN) {
+      WEEZTIX_REFRESH_TOKEN_RUNTIME = process.env.WEEZTIX_REFRESH_TOKEN;
+      console.log('🔑 Using refresh token from ENV (seeding Redis)');
+      await redisSet('weeztix_refresh_token', WEEZTIX_REFRESH_TOKEN_RUNTIME);
+    } else {
+      console.warn('⚠️ No refresh token in Redis or ENV yet. Use /weeztix/connect to obtain one.');
+    }
+  } catch (e) {
+    console.error('Startup refresh token load error:', e?.message || e);
+  }
+})();
+
+// Refresh lock (per-process)
 let REFRESH_IN_FLIGHT = null;
 
 async function refreshAccessToken() {
   if (REFRESH_IN_FLIGHT) return REFRESH_IN_FLIGHT;
 
-  // FIX: close this IIFE properly, then await it with try/finally below
   REFRESH_IN_FLIGHT = (async () => {
     const clientId = process.env.OAUTH_CLIENT_ID;
     const clientSecret = process.env.OAUTH_CLIENT_SECRET;
 
     if (!clientId || !clientSecret) throw new Error('Missing OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET');
 
-    const refreshToken = WEEZTIX_REFRESH_TOKEN_RUNTIME || process.env.WEEZTIX_REFRESH_TOKEN;
-    if (!refreshToken) throw new Error('Missing WEEZTIX_REFRESH_TOKEN');
+    // Always re-read the latest refresh token from Redis before refreshing
+    const tokenFromRedis = await redisGet('weeztix_refresh_token');
+    const refreshToken = tokenFromRedis || WEEZTIX_REFRESH_TOKEN_RUNTIME || process.env.WEEZTIX_REFRESH_TOKEN;
+    if (!refreshToken) throw new Error('Missing WEEZTIX_REFRESH_TOKEN (Redis/ENV)');
 
     const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
 
@@ -189,24 +267,24 @@ async function refreshAccessToken() {
 
     const at = r.data?.access_token;
 
-    // 🔎 DEBUG: ensure it's a JWT (must have 2 dots)
+    // Ensure access token looks like a JWT (two dots)
     const dotCount = (typeof at === 'string') ? (at.match(/\./g) || []).length : -1;
     console.log('🧪 access_token dots:', dotCount, 'type:', typeof at, 'preview:', (at || '').slice(0, 25));
-
     if (!at || typeof at !== 'string' || dotCount < 2) {
       throw new Error('Refresh returned non-JWT access_token (expected 2 dots)');
     }
 
     WEEZTIX_ACCESS_TOKEN = at;
 
+    // If refresh token rotated, persist to Redis and update runtime
     if (r.data.refresh_token && typeof r.data.refresh_token === 'string') {
       WEEZTIX_REFRESH_TOKEN_RUNTIME = r.data.refresh_token;
-      console.log('🔁 Weeztix rotated refresh_token. NEW refresh_token:', r.data.refresh_token);
+      await redisSet('weeztix_refresh_token', r.data.refresh_token);
+      console.log('🔁 Weeztix rotated refresh_token and saved to Redis');
 
-      // Optional admin ping on rotation
       if (ADMIN_CHAT_ID) {
-        try { await tgSend(ADMIN_CHAT_ID, '🔁 Weeztix: refresh_token has rotated. Update env if you persist it.'); }
-        catch (_) { /* ignore */ }
+        try { await tgSend(ADMIN_CHAT_ID, '🔁 Weeztix: refresh_token rotated and persisted to Redis.'); }
+        catch (_) {}
       }
     }
 
