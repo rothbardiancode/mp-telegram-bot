@@ -169,36 +169,31 @@ async function refreshAccessToken() {
     params.append('refresh_token', refreshToken);
 
     const r = await axios.post('https://auth.weeztix.com/tokens', params, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${basicAuth}`
-      },
-      timeout: 15000
-    });
+  headers: {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Authorization': `Basic ${basicAuth}`
+  },
+  timeout: 15000
+});
 
-    WEEZTIX_ACCESS_TOKEN = r.data.access_token;
+const at = r.data?.access_token;
 
-    if (r.data.refresh_token && typeof r.data.refresh_token === 'string') {
-      WEEZTIX_REFRESH_TOKEN_RUNTIME = r.data.refresh_token;
-      console.log('🔁 Weeztix rotated refresh_token. NEW refresh_token:', r.data.refresh_token);
+// 🔎 DEBUG: controlliamo che sia un vero JWT (deve avere 2 punti)
+const dotCount = (typeof at === 'string') ? (at.match(/\./g) || []).length : -1;
+console.log('🧪 access_token dots:', dotCount, 'type:', typeof at, 'preview:', (at || '').slice(0, 25));
 
-      const adminId = process.env.ADMIN_CHAT_ID;
-      if (adminId) {
-        try {
-          await tgSend(
-            adminId,
-            '🔁 Weeztix ha ruotato il refresh token.\n\n' +
-              '⚠️ Aggiorna Render ENV: WEEZTIX_REFRESH_TOKEN\n' +
-              'Lo trovi nei Render logs: "NEW refresh_token"'
-          );
-        } catch (err) {
-          console.log('Admin notify failed:', err?.message || err);
-        }
-      }
-    }
+if (!at || typeof at !== 'string' || dotCount < 2) {
+  throw new Error('Refresh returned non-JWT access_token (expected 2 dots)');
+}
 
-    return WEEZTIX_ACCESS_TOKEN;
-  })();
+WEEZTIX_ACCESS_TOKEN = at;
+
+if (r.data.refresh_token && typeof r.data.refresh_token === 'string') {
+  WEEZTIX_REFRESH_TOKEN_RUNTIME = r.data.refresh_token;
+  console.log('🔁 Weeztix rotated refresh_token. NEW refresh_token:', r.data.refresh_token);
+}
+
+return WEEZTIX_ACCESS_TOKEN;
 
   try {
     return await REFRESH_IN_FLIGHT;
