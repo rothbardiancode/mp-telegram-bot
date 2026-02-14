@@ -1,7 +1,6 @@
 /**
- * MP Telegram Bot + Weeztix/OpenTicket OAuth + Stats + Trend + Event Night + Promo Codes
- *
- * Render Free plan: instance spins down; we auto-refresh stats on-demand.
+ * MP Telegram Bot + Weeztix/OpenTicket OAuth + Stats Polling + Trend + Event Night + Promo Codes
+ * Render Free: instance spins down; we ACK webhook immediately + auto-poll on first command.
  *
  * ENV required:
  * BOT_TOKEN
@@ -44,6 +43,7 @@ async function tgSend(chatId, text) {
   await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text }, { timeout: 15000 });
 }
 
+// Telegram message size limit: chunk long replies safely
 async function tgSendLong(chatId, text, chunkSize = 3500) {
   if (!text || typeof text !== 'string') return;
   for (let i = 0; i < text.length; i += chunkSize) {
@@ -59,9 +59,9 @@ async function withRetry(fn, {
   shouldRetry = (err) => {
     const status = err?.response?.status;
     const code = err?.code;
-    if (code === 'ECONNABORTED') return true;
-    if (!status) return true;
-    if (status === 429) return true;
+    if (code === 'ECONNABORTED') return true; // axios timeout
+    if (!status) return true;                // network/DNS
+    if (status === 429) return true;         // rate limit
     return false;
   }
 } = {}) {
@@ -83,8 +83,13 @@ async function withRetry(fn, {
 const MP_CAPACITY = Number(process.env.MP_CAPACITY || 0);
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || null;
 
+// Organizer opt-in alerts (DM)
 const alertSubscribers = new Set();
+
+// Sellout alerts (sold-based)
 const selloutAlerts = { p80: false, p90: false, p95: false, p100: false };
+
+// Door alerts (scanned-based)
 const doorAlerts = { p70: false, p85: false, p95: false };
 
 async function broadcastAlert(message) {
@@ -342,7 +347,6 @@ async function fetchCompanyGuidIfNeeded() {
   await ensureAccessToken();
 
   try {
-    // Token validity + company context, per docs. [4](https://docs.weeztix.com/api/dashboard/get-coupon-specific/)
     const r = await axios.get('https://auth.weeztix.com/users/me', {
       headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
       timeout: 15000
@@ -350,10 +354,7 @@ async function fetchCompanyGuidIfNeeded() {
 
     const data = r.data || {};
     const candidates = [];
-
-    const pushIfGuid = (x) => {
-      if (typeof x === 'string' && x.length >= 30) candidates.push(x);
-    };
+    const pushIfGuid = (x) => { if (typeof x === 'string' && x.length >= 30) candidates.push(x); };
 
     if (Array.isArray(data.companies)) {
       for (const c of data.companies) {
@@ -381,7 +382,7 @@ async function weeztixGet(path, { timeout = 20000, companyScoped = false } = {})
   const headers = { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` };
   if (companyScoped) {
     const cg = await fetchCompanyGuidIfNeeded();
-    if (cg) headers['Company'] = cg; // some endpoints require Company header [4](https://docs.weeztix.com/api/dashboard/get-coupon-specific/)
+    if (cg) headers['Company'] = cg;
   }
   return axios.get(`${WEEZTIX_API_BASE}${path}`, { headers, timeout });
 }
@@ -390,9 +391,9 @@ async function weeztixGet(path, { timeout = 20000, companyScoped = false } = {})
 let weeztixLastOkAt = null;
 let weeztixLastError = null;
 let weeztixLastRaw = null;
-let weeztixTicketStats = [];
+let weeztixTicketStats = []; // [{id, sold, scanned}]
 
-const statsSeries = [];
+const statsSeries = []; // [{ts, soldTotal, scannedTotal}]
 const SERIES_KEEP_MS = 48 * 60 * 60 * 1000;
 
 function parseWeeztixStats(data) {
@@ -506,6 +507,7 @@ async function fetchWeeztixStats() {
       if (pctDoor >= 0.85 && !doorAlerts.p85) { doorAlerts.p85 = true; await broadcastAlert(`⚠️ Porta: 85% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nOcchio fila / sicurezza.`); }
       if (pctDoor >= 0.95 && !doorAlerts.p95) { doorAlerts.p95 = true; await broadcastAlert(`🚨 Porta: 95% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nValuta STOP ingressi.`); }
     }
+
   } catch (e) {
     const code = e?.code;
     const status = e?.response?.status;
@@ -529,11 +531,12 @@ function lastOkAgeMs() {
 
 async function ensureStatsFresh() {
   if (lastOkAgeMs() > STATS_MAX_AGE_MS) {
+    console.log('⏳ Cold-start or stale stats → auto-polling now...');
     await fetchWeeztixStats();
   }
 }
 
-// -------------------- Capacities (deep extraction) --------------------
+// -------------------- Capacities (deep extraction + HARD OVERRIDE for available_stock) --------------------
 let weeztixCapByTicketId = {};
 let weeztixCapMetaByTicketId = {}; // {id: {fieldPath, rawValue, derived}}
 let weeztixCapLastOkAt = null;
@@ -552,7 +555,9 @@ function extractTicketArray(obj) {
   if (!obj) return null;
   if (Array.isArray(obj)) return obj;
 
-  const candidates = [obj.tickets, obj.ticketTypes, obj.ticket_types, obj.ticket, obj.data, obj.results, obj.items];
+  const candidates = [
+    obj.tickets, obj.ticketTypes, obj.ticket_types, obj.ticket, obj.data, obj.results, obj.items
+  ];
   for (const c of candidates) if (Array.isArray(c)) return c;
 
   for (const [k, v] of Object.entries(obj)) {
@@ -568,7 +573,6 @@ function extractTicketId(t) {
 function collectNumericFields(obj, prefix = '', depth = 0, out = []) {
   if (!obj || typeof obj !== 'object' || depth > 6) return out;
   if (Array.isArray(obj)) {
-    // don't traverse huge arrays except small ones
     if (obj.length > 25) return out;
     obj.forEach((v, i) => collectNumericFields(v, `${prefix}[${i}]`, depth + 1, out));
     return out;
@@ -586,11 +590,14 @@ function scoreCapacityPath(pathLower) {
   let score = 0;
 
   // strong positives
-  const strong = ['capacity', 'stock', 'inventory', 'remaining', 'available', 'quota'];
-  const medium = ['limit', 'max_sales', 'maxsales', 'maxsale', 'max_tickets', 'maxtickets', 'ticket_limit'];
+  const strong = ['capacity', 'stock', 'inventory', 'quota', 'available_stock'];
+  const medium = ['limit', 'max_sales', 'maxsales', 'max_tickets', 'maxtickets'];
 
   for (const s of strong) if (pathLower.includes(s)) score += 50;
   for (const m of medium) if (pathLower.includes(m)) score += 25;
+
+  // big boost if explicitly available_stock
+  if (pathLower.includes('available_stock')) score += 80;
 
   // negatives (avoid pricing / per-order limits)
   const negatives = [
@@ -600,10 +607,7 @@ function scoreCapacityPath(pathLower) {
   ];
   for (const n of negatives) if (pathLower.includes(n)) score -= 30;
 
-  // small boost if path ends with these exact keys
-  if (pathLower.endsWith('.capacity') || pathLower.endsWith('.stock')) score += 20;
-  if (pathLower.endsWith('.remaining') || pathLower.endsWith('.available')) score += 15;
-
+  if (pathLower.endsWith('.capacity') || pathLower.endsWith('.stock') || pathLower.endsWith('.available_stock')) score += 20;
   return score;
 }
 
@@ -613,7 +617,6 @@ function extractCapacityDeep(ticketObj, soldById) {
 
   if (!fields.length) return { cap: null, meta: null };
 
-  // pick best candidate by score
   let best = null;
   for (const f of fields) {
     const p = String(f.path || '');
@@ -622,46 +625,36 @@ function extractCapacityDeep(ticketObj, soldById) {
     if (s <= 0) continue;
     if (!best || s > best.score) best = { ...f, score: s };
   }
-
   if (!best) return { cap: null, meta: null };
 
-  // If chosen field indicates "available/remaining", derive total = available + sold
   const pl = best.path.toLowerCase();
-  let cap = best.value;
 
+  let cap = Number(best.value);
   let derived = false;
-  // Only derive total capacity when we are confident the field is "remaining/left".
-// Many APIs use "available" to mean *total stock*, not remaining.
-// Only derive total capacity when we are confident the field is "remaining/left".
-// IMPORTANT: in your tenant, "available_stock" is TOTAL capacity (do NOT derive).
-if (
-  pl.includes('remaining') ||
-  pl.includes('left') ||
-  pl.includes('remaining_count') ||
-  pl.includes('remainingcount') ||
-  pl.includes('stock_left') ||
-  pl.includes('stockleft')
-) {
-  const sold = (soldById && id) ? Number(soldById[id] || 0) : 0;
-  cap = Number(best.value) + sold;
-  derived = true;
-} else {
-  // Treat available_stock / stock / capacity as total capacity
-  cap = Number(best.value);
-  derived = false;
-}
 
- // HARD OVERRIDE: in this tenant, available_stock is TOTAL capacity, never remaining.
-if (pl.includes('available_stock')) {
-  cap = Number(best.value);
-  derived = false;
-}
+  // Derive only when clearly "remaining/left"
+  if (
+    pl.includes('remaining') ||
+    pl.includes('left') ||
+    pl.includes('remaining_count') ||
+    pl.includes('remainingcount') ||
+    pl.includes('stock_left') ||
+    pl.includes('stockleft')
+  ) {
+    const sold = (soldById && id) ? Number(soldById[id] || 0) : 0;
+    cap = Number(best.value) + sold;
+    derived = true;
+  }
+
+  // ✅ HARD OVERRIDE: in your tenant, available_stock is TOTAL capacity, never remaining.
+  if (pl.includes('available_stock')) {
+    cap = Number(best.value);
+    derived = false;
+  }
+
   if (!Number.isFinite(cap) || cap < 0) return { cap: null, meta: null };
 
-  return {
-    cap,
-    meta: { fieldPath: best.path, rawValue: best.value, derived }
-  };
+  return { cap, meta: { fieldPath: best.path, rawValue: best.value, derived } };
 }
 
 async function fetchCapacitiesFromApi() {
@@ -680,10 +673,10 @@ async function fetchCapacitiesFromApi() {
   const qs = qsForDashboard();
   const join = qs ? '&' : '?';
 
-  // Your tenant: /event/{guid}/tickets is 404, /event/{guid}/ticket works (array). [1](https://docs.weeztix.com/docs/events/overview/)
+  // Your tenant: /event/{guid}/ticket works; /event/{guid}/tickets may 404.
   const endpointsToTry = [
     `/event/${WEEZTIX_EVENT_GUID}/ticket${qs}`,
-    `/event/${WEEZTIX_EVENT_GUID}/tickets${qs}`, // keep for completeness
+    `/event/${WEEZTIX_EVENT_GUID}/tickets${qs}`,
     `/ticket${qs}${join}event_guid=${encodeURIComponent(WEEZTIX_EVENT_GUID)}`,
     `/event/${WEEZTIX_EVENT_GUID}${qs}`
   ];
@@ -839,6 +832,7 @@ function isCouponEnabled(c) {
 async function fetchCouponCodesBestEffort(couponGuid) {
   const qs = qsForDashboard();
   const paths = [
+    `/coupon/normal${qs}`,
     `/coupon/${couponGuid}${qs}`,
     `/coupon/${couponGuid}/codes${qs}`,
     `/coupon/${couponGuid}/couponcodes${qs}`,
@@ -850,18 +844,13 @@ async function fetchCouponCodesBestEffort(couponGuid) {
       const r = await weeztixGet(p, { timeout: 20000, companyScoped: true });
       const data = r.data;
 
-      if (!p.includes('/codes')) {
-        const embedded = extractCouponCodesFromObject(data);
-        if (embedded.length) return embedded;
-      }
+      const embedded = extractCouponCodesFromObject(data);
+      if (embedded.length) return embedded;
 
       if (Array.isArray(data)) {
         const codes = data.map(x => (typeof x === 'string' ? x : x?.code)).filter(Boolean);
         if (codes.length) return codes;
       }
-
-      const nested = extractCouponCodesFromObject(data);
-      if (nested.length) return nested;
 
       if (Array.isArray(data?.results)) {
         const codes = data.results.map(x => x?.code).filter(Boolean);
@@ -912,7 +901,46 @@ async function handlePasswordsCommand(chatId) {
   await tgSendLong(chatId, lines.join('\n'));
 }
 
-// -------------------- Webhook (ACK immediately, process async) --------------------
+// -------------------- Debug helpers --------------------
+async function handleTicketRaw(chatId) {
+  try {
+    const r = await weeztixGet(`/event/${WEEZTIX_EVENT_GUID}/ticket${qsForDashboard()}`, { timeout: 25000, companyScoped: true });
+    const arr = extractTicketArray(r.data) || [];
+    const first = arr[0] || r.data;
+    const preview = JSON.stringify(first, null, 2).slice(0, 3500);
+    await tgSend(chatId, `🧾 TICKET RAW (first item, trimmed)\n\n${preview}`);
+  } catch (e) {
+    const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 1200) : (e?.message || String(e));
+    await tgSend(chatId, `❌ /ticket_raw failed: ${detail}`);
+  }
+}
+
+async function handleCapacitiesDebug(chatId) {
+  await ensureStatsFresh();
+  await ensureCapacitiesFresh();
+
+  const keys = Object.keys(weeztixCapByTicketId || {});
+  const sample = keys.slice(0, 15).map(k => {
+    const meta = weeztixCapMetaByTicketId[k];
+    const m = meta ? ` (field=${meta.fieldPath}, derived=${meta.derived})` : '';
+    return `• ${ticketLabel(k)} (${k.slice(0, 8)}…): cap=${weeztixCapByTicketId[k]}${m}`;
+  }).join('\n');
+
+  const dbg = JSON.stringify(weeztixCapDebug, null, 2).slice(0, 2500);
+
+  await tgSendLong(chatId,
+    `🧪 CAPACITIES DEBUG\n` +
+    `Event GUID: ${WEEZTIX_EVENT_GUID}\n` +
+    `QS used: ${qsForDashboard() || '(none)'}\n` +
+    `Ultimo OK cap: ${weeztixCapLastOkAt || 'mai'}\n` +
+    `Errore cap: ${weeztixCapLastError || '—'}\n` +
+    `Entries: ${keys.length}\n\n` +
+    `Sample:\n${sample || '(vuoto)'}\n\n` +
+    `Tried endpoints:\n${dbg}`
+  );
+}
+
+// -------------------- Telegram webhook (ACK immediately, process async) --------------------
 app.post('/webhook', (req, res) => {
   res.sendStatus(200);
 
@@ -924,6 +952,7 @@ app.post('/webhook', (req, res) => {
       const chatId = msg.chat.id;
       const text = (msg.text || '').trim();
 
+      // --- meta/ops ---
       if (text === '/whoami') {
         await tgSend(chatId, `🆔 Il tuo chat ID è: ${chatId}`);
         return;
@@ -946,6 +975,7 @@ app.post('/webhook', (req, res) => {
         return;
       }
 
+      // --- alerts ---
       if (text.startsWith('/alerts_on')) {
         alertSubscribers.add(chatId);
         await tgSend(chatId, '🔔 Alert attivati (sell-out + porta se disponibile).');
@@ -958,48 +988,40 @@ app.post('/webhook', (req, res) => {
         return;
       }
 
-      if (text.startsWith('/passwords')) {
-        await handlePasswordsCommand(chatId);
+      // --- debugging ---
+      if (text.startsWith('/debugweeztix')) {
+        await ensureStatsFresh();
+        const sample = weeztixTicketStats.slice(0, 12)
+          .map(t => `• ${ticketLabel(t.id)} (${t.id.slice(0, 8)}…) | sold=${t.sold} | scanned=${t.scanned}`)
+          .join('\n');
+
+        await tgSend(
+          chatId,
+          `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nTicket rows: ${weeztixTicketStats.length}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}\n\nSample:\n${sample || '(vuoto)'}`
+        );
+        return;
+      }
+
+      if (text.startsWith('/debugweeztix_raw')) {
+        await ensureStatsFresh();
+        const preview = weeztixLastRaw ? JSON.stringify(weeztixLastRaw, null, 2).slice(0, 3500) : '(vuoto)';
+        await tgSend(chatId, `🧾 WEEZTIX RAW (trimmed)\n\n${preview}`);
         return;
       }
 
       if (text.startsWith('/ticket_raw')) {
-        // NEW: show first ticket object so we can identify correct capacity field name
-        try {
-          const r = await weeztixGet(`/event/${WEEZTIX_EVENT_GUID}/ticket${qsForDashboard()}`, { timeout: 25000, companyScoped: true });
-          const arr = extractTicketArray(r.data) || [];
-          const first = arr[0] || r.data;
-          const preview = JSON.stringify(first, null, 2).slice(0, 3500);
-          await tgSend(chatId, `🧾 TICKET RAW (first item, trimmed)\n\n${preview}`);
-        } catch (e) {
-          const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 1200) : (e?.message || String(e));
-          await tgSend(chatId, `❌ /ticket_raw failed: ${detail}`);
-        }
+        await handleTicketRaw(chatId);
         return;
       }
 
       if (text.startsWith('/capacities_debug')) {
-        await ensureStatsFresh();
-        await ensureCapacitiesFresh();
+        await handleCapacitiesDebug(chatId);
+        return;
+      }
 
-        const keys = Object.keys(weeztixCapByTicketId || {});
-        const sample = keys.slice(0, 15).map(k => {
-          const meta = weeztixCapMetaByTicketId[k];
-          const m = meta ? ` (field=${meta.fieldPath}${meta.derived ? ', derived' : ''})` : '';
-          return `• ${ticketLabel(k)} (${k.slice(0, 8)}…): cap=${weeztixCapByTicketId[k]}${m}`;
-        }).join('\n');
-
-        const dbg = JSON.stringify(weeztixCapDebug, null, 2).slice(0, 2500);
-        await tgSendLong(chatId,
-          `🧪 CAPACITIES DEBUG\n` +
-          `Event GUID: ${WEEZTIX_EVENT_GUID}\n` +
-          `QS used: ${qsForDashboard() || '(none)'}\n` +
-          `Ultimo OK cap: ${weeztixCapLastOkAt || 'mai'}\n` +
-          `Errore cap: ${weeztixCapLastError || '—'}\n` +
-          `Entries: ${keys.length}\n\n` +
-          `Sample:\n${sample || '(vuoto)'}\n\n` +
-          `Tried endpoints:\n${dbg}`
-        );
+      // --- new features ---
+      if (text.startsWith('/passwords')) {
+        await handlePasswordsCommand(chatId);
         return;
       }
 
@@ -1040,7 +1062,7 @@ app.post('/webhook', (req, res) => {
 
         const capNote = (Object.keys(weeztixCapByTicketId || {}).length)
           ? ''
-          : '\nℹ️ Capacità per wave non trovata nei ticket object. Prova /ticket_raw per vedere i campi disponibili (probabile che stock sia su “shop attachment”).';
+          : '\nℹ️ Capacità per wave non trovata. Usa /ticket_raw e /capacities_debug.';
 
         await tgSend(
           chatId,
@@ -1049,7 +1071,101 @@ app.post('/webhook', (req, res) => {
         return;
       }
 
-      // keep other commands as-is (trend/night/debug can be added back similarly if you want)
+      // --- trend ---
+      if (text.startsWith('/trend')) {
+        await ensureStatsFresh();
+
+        if (statsSeries.length < 2) {
+          await tgSend(chatId, '📈 Trend: serve qualche minuto di dati. Fai /poll_now e riprova tra 2–3 minuti.');
+          return;
+        }
+
+        const now = Date.now();
+        const soldNow = statsSeries[statsSeries.length - 1].soldTotal;
+
+        const findClosest = (msAgo) => {
+          const target = now - msAgo;
+          for (const p of statsSeries) if (p.ts >= target) return p;
+          return statsSeries[0];
+        };
+
+        const p1h = findClosest(60 * 60 * 1000);
+        const p24h = findClosest(24 * 60 * 60 * 1000);
+
+        const delta1h = soldNow - p1h.soldTotal;
+        const delta24h = soldNow - p24h.soldTotal;
+
+        const hoursCovered24 = Math.max(1, (now - p24h.ts) / (60 * 60 * 1000));
+        const avgPerHour24 = delta24h / hoursCovered24;
+
+        let etaLine = '⏳ ETA sold-out: n/d';
+        if (MP_CAPACITY > 0) {
+          const remaining = Math.max(0, MP_CAPACITY - soldNow);
+          const pace = delta1h > 0 ? delta1h : (avgPerHour24 > 0 ? avgPerHour24 : 0);
+
+          if (remaining === 0) etaLine = '🟥 SOLD OUT';
+          else if (pace > 0) {
+            const etaTs = now + (remaining / pace) * 60 * 60 * 1000;
+            etaLine = `⏳ ETA sold-out: ~${new Date(etaTs).toLocaleString('it-BE', { timeZone: 'Europe/Brussels' })} (pace ~${pace.toFixed(1)}/h)`;
+          } else etaLine = '⏳ ETA sold-out: n/d (pace ~0)';
+        }
+
+        await tgSend(
+          chatId,
+          `📈 TREND VENDITE\n` +
+          `Ultima ora: +${delta1h}\n` +
+          `Media (ultime ${hoursCovered24.toFixed(1)}h): ${avgPerHour24.toFixed(1)}/h\n` +
+          `${etaLine}\n` +
+          `Venduti ora: ${soldNow}${MP_CAPACITY ? `/${MP_CAPACITY}` : ''}`
+        );
+        return;
+      }
+
+      // --- night ---
+      if (text.startsWith('/night')) {
+        await ensureStatsFresh();
+
+        if (statsSeries.length < 2) {
+          await tgSend(chatId, '🌙 Event Night: serve qualche punto dati. Fai /poll_now e riprova tra 2–3 minuti.');
+          return;
+        }
+
+        const now = Date.now();
+        const last = statsSeries[statsSeries.length - 1];
+
+        const target15 = now - 15 * 60 * 1000;
+        let p15 = null;
+        for (const p of statsSeries) { if (p.ts >= target15) { p15 = p; break; } }
+        p15 = p15 || statsSeries[0];
+
+        const scannedNow = last.scannedTotal || 0;
+        const soldNow = last.soldTotal || 0;
+
+        const delta15 = scannedNow - (p15.scannedTotal || 0);
+        const perHour = delta15 * 4;
+
+        const useProxy = scannedNow === 0;
+        const used = useProxy ? soldNow : scannedNow;
+
+        let capLine = 'Capienza: n/d';
+        if (MP_CAPACITY > 0) capLine = `Capienza: ${Math.round((used / MP_CAPACITY) * 100)}% (${used}/${MP_CAPACITY})`;
+
+        const paceLine = useProxy
+          ? '⚡ Ritmo ingressi: n/d (scanned non disponibile)'
+          : `⚡ Ritmo ingressi (ult 15m): ${delta15} (+${perHour}/h)`;
+
+        const proxyNote = useProxy
+          ? '\nℹ️ Nota: non vedo “scanned” da Weeztix → uso i venduti come proxy (non ideale per la porta).'
+          : '';
+
+        await tgSend(
+          chatId,
+          `🌙 EVENT NIGHT\n🚪 Entrati: ${useProxy ? 'n/d' : scannedNow}\n🎟 Venduti: ${soldNow}\n${paceLine}\n📊 ${capLine}${proxyNote}`
+        );
+        return;
+      }
+
+      // Default: ignore unknown commands
     } catch (e) {
       console.error('Telegram webhook async error:', e?.response?.data || e.message || e);
       try {
