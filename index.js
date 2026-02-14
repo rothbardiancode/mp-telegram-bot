@@ -628,6 +628,16 @@ function extractCapacityDeep(ticketObj, soldById) {
   if (!best) return { cap: null, meta: null };
 
   const pl = best.path.toLowerCase();
+  // ✅ HARD EARLY RETURN: in this tenant, available_stock is TOTAL capacity, never remaining.
+// This prevents any later logic from setting derived=true or altering cap.
+if (pl.includes('available_stock')) {
+  const cap = Number(best.value);
+  if (!Number.isFinite(cap) || cap < 0) return { cap: null, meta: null };
+  return {
+    cap,
+    meta: { fieldPath: best.path, rawValue: best.value, derived: false }
+  };
+}
 
   let cap = Number(best.value);
   let derived = false;
@@ -644,12 +654,6 @@ function extractCapacityDeep(ticketObj, soldById) {
     const sold = (soldById && id) ? Number(soldById[id] || 0) : 0;
     cap = Number(best.value) + sold;
     derived = true;
-  }
-
-  // ✅ HARD OVERRIDE: in your tenant, available_stock is TOTAL capacity, never remaining.
-  if (pl.includes('available_stock')) {
-    cap = Number(best.value);
-    derived = false;
   }
 
   if (!Number.isFinite(cap) || cap < 0) return { cap: null, meta: null };
