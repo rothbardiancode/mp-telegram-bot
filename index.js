@@ -632,16 +632,23 @@ function extractCapacityDeep(ticketObj, soldById) {
   let derived = false;
   // Only derive total capacity when we are confident the field is "remaining/left".
 // Many APIs use "available" to mean *total stock*, not remaining.
+// Only derive total capacity when we are confident the field is "remaining/left".
+// IMPORTANT: in your tenant, "available_stock" is TOTAL capacity (do NOT derive).
 if (
   pl.includes('remaining') ||
   pl.includes('left') ||
-  pl.includes('available_remaining') ||
+  pl.includes('remaining_count') ||
   pl.includes('remainingcount') ||
-  pl.includes('remaining_count')
+  pl.includes('stock_left') ||
+  pl.includes('stockleft')
 ) {
   const sold = (soldById && id) ? Number(soldById[id] || 0) : 0;
   cap = Number(best.value) + sold;
   derived = true;
+} else {
+  // Treat available_stock / stock / capacity as total capacity
+  cap = Number(best.value);
+  derived = false;
 }
 
   if (!Number.isFinite(cap) || cap < 0) return { cap: null, meta: null };
