@@ -1,21 +1,22 @@
 /**
  * MP Telegram Bot + Weeztix OAuth + Stats Polling + Trend + Event Night
- * STABLE VERSION: polling ON, refresh ONLY on Weeztix API 401.
+ * Render Free plan: instance spins down; we auto-refresh stats on-demand.
  *
- * Render ENV required:
+ * ENV required:
  * BOT_TOKEN
  * OAUTH_CLIENT_ID
  * OAUTH_CLIENT_SECRET
- * OAUTH_CLIENT_REDIRECT   (https://mp-telegram-bot-den5.onrender.com/weeztix/callback)
+ * OAUTH_CLIENT_REDIRECT
  * WEEZTIX_EVENT_GUID
- * MP_CAPACITY             (e.g. 400)
+ * MP_CAPACITY
  *
- * After connecting (first OAuth exchange):
- * WEEZTIX_REFRESH_TOKEN   (used only as seed; thereafter Redis is source of truth)
+ * After connecting:
+ * WEEZTIX_REFRESH_TOKEN  (seed only; thereafter Redis is source of truth)
  *
  * Optional:
  * WEEZTIX_POLL_SECONDS (default 90)
- * ADMIN_CHAT_ID (optional; if set, bot pings you when refresh token rotates)
+ * ADMIN_CHAT_ID
+ * WEEZTIX_API_BASE (default https://api.weeztix.com)
  *
  * Redis (Upstash REST):
  * REDIS_URL
@@ -38,16 +39,19 @@ if (!BOT_TOKEN) {
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 async function tgSend(chatId, text) {
-  try {
-    await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text }, { timeout: 15000 });
-  } catch (e) {
-    console.error('Telegram send error:', e?.response?.data || e.message || e);
-    throw e;
+  await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text }, { timeout: 15000 });
+}
+
+// Telegram has message length limits; split long replies safely
+async function tgSendLong(chatId, text, chunkSize = 3500) {
+  if (!text || typeof text !== 'string') return;
+  for (let i = 0; i < text.length; i += chunkSize) {
+    const chunk = text.slice(i, i + chunkSize);
+    await tgSend(chatId, chunk);
   }
 }
 
-// ----- Generic retry helper (network/timeout safe) -----
-// (NEW) Retries timeouts/network errors with exponential backoff
+// -------------------- Generic retry helper --------------------
 async function withRetry(fn, {
   retries = 2,
   initialDelayMs = 800,
@@ -55,10 +59,9 @@ async function withRetry(fn, {
   shouldRetry = (err) => {
     const status = err?.response?.status;
     const code = err?.code;
-    // Retry on timeouts and network errors; avoid retrying on 4xx except 429
     if (code === 'ECONNABORTED') return true; // axios timeout
-    if (!status) return true; // likely network/DNS
-    if (status === 429) return true; // rate limit
+    if (!status) return true;                // network/DNS
+    if (status === 429) return true;         // rate limit
     return false;
   }
 } = {}) {
@@ -89,17 +92,6 @@ const selloutAlerts = { p80: false, p90: false, p95: false, p100: false };
 // Door alerts (scanned-based, only if scanned exists)
 const doorAlerts = { p70: false, p85: false, p95: false };
 
-async function broadcastAlert(message) {
-  const ids = Array.from(alertSubscribers);
-  for (const id of ids) {
-    try {
-      await tgSend(id, message);
-    } catch {
-      alertSubscribers.delete(id);
-    }
-  }
-}
-
 // -------------------- Redis (Upstash REST) --------------------
 const REDIS_URL = process.env.REDIS_URL || '';
 const REDIS_TOKEN = process.env.REDIS_TOKEN || '';
@@ -108,8 +100,6 @@ function redisAvailable() {
   return Boolean(REDIS_URL && REDIS_TOKEN);
 }
 
-// Simple Upstash REST helpers.
-// Docs: https://docs.upstash.com/redis/features/restapi
 async function redisGet(key) {
   if (!redisAvailable()) return null;
   try {
@@ -221,29 +211,23 @@ app.get('/weeztix/callback', async (req, res) => {
       has_refresh_token: !!r.data?.refresh_token
     });
 
-    // If we receive a refresh_token here, seed Redis immediately.
     if (r.data?.refresh_token && typeof r.data.refresh_token === 'string') {
-      try {
-        await redisSet('weeztix_refresh_token', r.data.refresh_token);
-        console.log('🔑 Saved initial refresh_token to Redis');
-      } catch (_) {}
+      await redisSet('weeztix_refresh_token', r.data.refresh_token);
+      console.log('🔑 Saved initial refresh_token to Redis');
     }
 
-    return res.send('✅ Weeztix connected. If needed, check logs. Bot will persist refresh rotations to Redis automatically.');
+    return res.send('✅ Weeztix connected. Refresh token persisted to Redis. You can close this tab.');
   } catch (e) {
     console.error('Callback error:', e?.response?.data || e.message || e);
     return res.status(500).send('Token exchange failed. Check logs.');
   }
 });
 
-// -------------------- Weeztix tokens (stable mode) --------------------
-// Access token cached in memory (no proactive refresh)
+// -------------------- Weeztix tokens --------------------
 let WEEZTIX_ACCESS_TOKEN = null;
-
-// Refresh token runtime (supports rotation) — Redis is the source of truth
 let WEEZTIX_REFRESH_TOKEN_RUNTIME = null;
+let REFRESH_IN_FLIGHT = null;
 
-// On startup, load from Redis; if missing, seed from ENV then persist.
 (async () => {
   try {
     const fromRedis = await redisGet('weeztix_refresh_token');
@@ -262,19 +246,14 @@ let WEEZTIX_REFRESH_TOKEN_RUNTIME = null;
   }
 })();
 
-// Refresh lock (per-process)
-let REFRESH_IN_FLIGHT = null;
-
 async function refreshAccessToken() {
   if (REFRESH_IN_FLIGHT) return REFRESH_IN_FLIGHT;
 
   REFRESH_IN_FLIGHT = (async () => {
     const clientId = process.env.OAUTH_CLIENT_ID;
     const clientSecret = process.env.OAUTH_CLIENT_SECRET;
-
     if (!clientId || !clientSecret) throw new Error('Missing OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET');
 
-    // Always re-read the latest refresh token from Redis before refreshing
     const tokenFromRedis = await redisGet('weeztix_refresh_token');
     const refreshToken = tokenFromRedis || WEEZTIX_REFRESH_TOKEN_RUNTIME || process.env.WEEZTIX_REFRESH_TOKEN;
     if (!refreshToken) throw new Error('Missing WEEZTIX_REFRESH_TOKEN (Redis/ENV)');
@@ -294,8 +273,6 @@ async function refreshAccessToken() {
     });
 
     const at = r.data?.access_token;
-
-    // Ensure access token looks like a JWT (two dots)
     const dotCount = (typeof at === 'string') ? (at.match(/\./g) || []).length : -1;
     console.log('🧪 access_token dots:', dotCount, 'type:', typeof at, 'preview:', (at || '').slice(0, 25));
     if (!at || typeof at !== 'string' || dotCount < 2) {
@@ -304,7 +281,6 @@ async function refreshAccessToken() {
 
     WEEZTIX_ACCESS_TOKEN = at;
 
-    // If refresh token rotated, persist to Redis and update runtime
     if (r.data.refresh_token && typeof r.data.refresh_token === 'string') {
       WEEZTIX_REFRESH_TOKEN_RUNTIME = r.data.refresh_token;
       await redisSet('weeztix_refresh_token', r.data.refresh_token);
@@ -326,18 +302,87 @@ async function refreshAccessToken() {
   }
 }
 
-// -------------------- Weeztix stats polling --------------------
+// -------------------- Weeztix API helpers --------------------
+const WEEZTIX_API_BASE = process.env.WEEZTIX_API_BASE || 'https://api.weeztix.com';
 const WEEZTIX_EVENT_GUID = process.env.WEEZTIX_EVENT_GUID;
-// (CHANGED) Default poll seconds 60 -> 90
 const WEEZTIX_POLL_SECONDS = Number(process.env.WEEZTIX_POLL_SECONDS || 90);
 
+let weeztixCompanyGuid = null; // cached, optional
+
+async function ensureAccessToken() {
+  if (!WEEZTIX_ACCESS_TOKEN) await refreshAccessToken();
+}
+
+async function fetchCompanyGuidIfNeeded() {
+  if (weeztixCompanyGuid) return weeztixCompanyGuid;
+
+  // try Redis cache first
+  const cached = await redisGet('weeztix_company_guid');
+  if (cached) {
+    weeztixCompanyGuid = cached;
+    return weeztixCompanyGuid;
+  }
+
+  await ensureAccessToken();
+
+  // Docs mention auth.weeztix.com/users/me as a quick token check and company context. [2](https://docs.weeztix.com/docs/introduction/issue-request/)
+  try {
+    const r = await axios.get('https://auth.weeztix.com/users/me', {
+      headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
+      timeout: 15000
+    });
+
+    // Heuristic extraction of company guid(s)
+    const data = r.data || {};
+    const candidates = [];
+
+    const pushIfGuid = (x) => {
+      if (typeof x === 'string' && x.length >= 30) candidates.push(x);
+    };
+
+    // common shapes
+    if (Array.isArray(data.companies)) {
+      for (const c of data.companies) {
+        pushIfGuid(c?.guid);
+        pushIfGuid(c?.id);
+      }
+    }
+    pushIfGuid(data.company_guid);
+    pushIfGuid(data.companyGuid);
+    pushIfGuid(data.company?.guid);
+
+    if (candidates.length) {
+      weeztixCompanyGuid = candidates[0];
+      await redisSet('weeztix_company_guid', weeztixCompanyGuid);
+      console.log('🏢 Detected company guid:', weeztixCompanyGuid);
+      return weeztixCompanyGuid;
+    }
+
+    return null;
+  } catch (e) {
+    console.warn('Could not determine company guid (non-fatal):', e?.response?.data || e.message || e);
+    return null;
+  }
+}
+
+async function weeztixGet(path, { timeout = 20000, companyScoped = false } = {}) {
+  await ensureAccessToken();
+  const headers = { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` };
+
+  if (companyScoped) {
+    const cg = await fetchCompanyGuidIfNeeded();
+    if (cg) headers['Company'] = cg; // optional but required for some endpoints [2](https://docs.weeztix.com/docs/introduction/issue-request/)
+  }
+
+  return axios.get(`${WEEZTIX_API_BASE}${path}`, { headers, timeout });
+}
+
+// -------------------- Weeztix stats polling --------------------
 let weeztixLastOkAt = null;
 let weeztixLastError = null;
 let weeztixLastRaw = null;
-
 let weeztixTicketStats = []; // [{ id, sold, scanned }]
 
-// ---- Time series for trend/night ----
 const statsSeries = []; // [{ ts, soldTotal, scannedTotal }]
 const SERIES_KEEP_MS = 48 * 60 * 60 * 1000; // 48h
 
@@ -389,20 +434,7 @@ function parseWeeztixStats(data) {
   for (const [id, sold] of Object.entries(soldById)) {
     out.push({ id, sold, scanned: scannedById[id] || 0 });
   }
-
   return out;
-}
-
-function groupTotals(field) {
-  const grouped = {};
-  let total = 0;
-  for (const t of weeztixTicketStats) {
-    const label = ticketLabel(t.id);
-    const val = Number(t[field] || 0);
-    grouped[label] = (grouped[label] || 0) + val;
-    total += val;
-  }
-  return { grouped, total };
 }
 
 async function fetchWeeztixStats() {
@@ -415,36 +447,23 @@ async function fetchWeeztixStats() {
     const url = `https://api.weeztix.com/statistics/dashboard/${WEEZTIX_EVENT_GUID}`;
 
     const callApi = async () => {
+      await ensureAccessToken();
       return axios.get(url, {
         headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
-        // (CHANGED) Timeout 20000 -> 30000
         timeout: 30000
       });
     };
 
     let resp;
-
     try {
-      if (!WEEZTIX_ACCESS_TOKEN) {
-        console.log('🔄 No access token → refreshing...');
-        await refreshAccessToken();
-      }
-      // (NEW) Add retry for transient timeouts/network errors
       resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
     } catch (e) {
       const status = e?.response?.status;
       const msg = e?.response?.data?.error_description || '';
 
-      // Refresh on:
-      // - 401 unauthorized
-      // - 400 malformed JWT
-      if (
-        status === 401 ||
-        (status === 400 && msg.includes('JWT'))
-      ) {
+      if (status === 401 || (status === 400 && msg.includes('JWT'))) {
         console.log('🔄 Access token invalid → refreshing...');
         await refreshAccessToken();
-        // (NEW) Retry with backoff after refresh as well
         resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
       } else {
         throw e;
@@ -466,34 +485,31 @@ async function fetchWeeztixStats() {
     const soldTotalNow = weeztixTicketStats.reduce((sum, t) => sum + (Number(t.sold) || 0), 0);
     const scannedTotalNow = weeztixTicketStats.reduce((sum, t) => sum + (Number(t.scanned) || 0), 0);
 
-    // time series store + cleanup
     statsSeries.push({ ts: Date.now(), soldTotal: soldTotalNow, scannedTotal: scannedTotalNow });
     const cutoff = Date.now() - SERIES_KEEP_MS;
     while (statsSeries.length && statsSeries[0].ts < cutoff) statsSeries.shift();
 
-    // Sellout alerts (sold-based)
+    // Alerts (sellout + door)
     if (MP_CAPACITY > 0 && alertSubscribers.size > 0) {
-      const pct = soldTotalNow / MP_CAPACITY;
-      if (pct >= 0.80 && !selloutAlerts.p80) { selloutAlerts.p80 = true; await broadcastAlert(`🔥 80% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}`); }
-      if (pct >= 0.90 && !selloutAlerts.p90) { selloutAlerts.p90 = true; await broadcastAlert(`🚀 90% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}`); }
-      if (pct >= 0.95 && !selloutAlerts.p95) { selloutAlerts.p95 = true; await broadcastAlert(`🚨 95% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}\nValuta chiusura biglietti.`); }
-      if (pct >= 1.00 && !selloutAlerts.p100) { selloutAlerts.p100 = true; await broadcastAlert(`🟥 SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}\nChiudi ticketing.`); }
+      const pctSold = soldTotalNow / MP_CAPACITY;
+      if (pctSold >= 0.80 && !selloutAlerts.p80) { selloutAlerts.p80 = true; await broadcastAlert(`🔥 80% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}`); }
+      if (pctSold >= 0.90 && !selloutAlerts.p90) { selloutAlerts.p90 = true; await broadcastAlert(`🚀 90% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}`); }
+      if (pctSold >= 0.95 && !selloutAlerts.p95) { selloutAlerts.p95 = true; await broadcastAlert(`🚨 95% SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}\nValuta chiusura biglietti.`); }
+      if (pctSold >= 1.00 && !selloutAlerts.p100) { selloutAlerts.p100 = true; await broadcastAlert(`🟥 SOLD OUT\n\nVenduti: ${soldTotalNow}/${MP_CAPACITY}\nChiudi ticketing.`); }
     }
 
-    // Door alerts (scanned-based) only if scanned exists
     if (MP_CAPACITY > 0 && alertSubscribers.size > 0 && scannedTotalNow > 0) {
-      const pct = scannedTotalNow / MP_CAPACITY;
-      if (pct >= 0.70 && !doorAlerts.p70) { doorAlerts.p70 = true; await broadcastAlert(`🚪 Porta: 70% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}`); }
-      if (pct >= 0.85 && !doorAlerts.p85) { doorAlerts.p85 = true; await broadcastAlert(`⚠️ Porta: 85% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nOcchio fila / sicurezza.`); }
-      if (pct >= 0.95 && !doorAlerts.p95) { doorAlerts.p95 = true; await broadcastAlert(`🚨 Porta: 95% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nValuta STOP ingressi.`); }
+      const pctDoor = scannedTotalNow / MP_CAPACITY;
+      if (pctDoor >= 0.70 && !doorAlerts.p70) { doorAlerts.p70 = true; await broadcastAlert(`🚪 Porta: 70% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}`); }
+      if (pctDoor >= 0.85 && !doorAlerts.p85) { doorAlerts.p85 = true; await broadcastAlert(`⚠️ Porta: 85% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nOcchio fila / sicurezza.`); }
+      if (pctDoor >= 0.95 && !doorAlerts.p95) { doorAlerts.p95 = true; await broadcastAlert(`🚨 Porta: 95% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nValuta STOP ingressi.`); }
     }
   } catch (e) {
-    // (CHANGED) Clearer timeout logging
     const code = e?.code;
     const status = e?.response?.status;
     const dataStr = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 800) : '';
     if (code === 'ECONNABORTED') {
-      weeztixLastError = `Timeout: stats call exceeded ${30000}ms`;
+      weeztixLastError = `Timeout: stats call exceeded 30000ms`;
       console.error('Weeztix stats timeout (axios ECONNABORTED).');
     } else if (status) {
       weeztixLastError = `HTTP ${status}: ${dataStr || '(no body)'}`;
@@ -503,191 +519,628 @@ async function fetchWeeztixStats() {
   }
 }
 
-// Start polling
+// Poller (will stop during Render sleep; on-demand refresh handles cold starts)
 setInterval(fetchWeeztixStats, WEEZTIX_POLL_SECONDS * 1000);
 
-// -------------------- Telegram webhook --------------------
-app.post('/webhook', async (req, res) => {
-  try {
-    const msg = req.body.message;
-    if (!msg) return res.sendStatus(200);
+// -------------------- Cold-start fix: ensure stats fresh on commands --------------------
+const STATS_MAX_AGE_MS = 5 * 60 * 1000;
 
-    const chatId = msg.chat.id;
-    const text = (msg.text || '').trim();
+function lastOkAgeMs() {
+  if (!weeztixLastOkAt) return Infinity;
+  const ts = Date.parse(weeztixLastOkAt);
+  return Number.isFinite(ts) ? (Date.now() - ts) : Infinity;
+}
 
-    // handy: get your chat id (for ADMIN_CHAT_ID)
-    if (text === '/whoami') {
-      await tgSend(chatId, `🆔 Il tuo chat ID è: ${chatId}`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/auth_check')) {
-      try {
-        // Force a token refresh to validate credentials
-        await refreshAccessToken();
-        await tgSend(chatId, '✅ OAuth OK: access token ottenuto.');
-      } catch (e) {
-        const detail = e?.response?.data ? JSON.stringify(e.response.data) : (e?.message || String(e));
-        await tgSend(chatId, `❌ OAuth FAIL: ${detail}`);
-      }
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/poll_now')) {
-      await fetchWeeztixStats();
-      await tgSend(chatId, `✅ Poll fatto.\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/alerts_on')) {
-      alertSubscribers.add(chatId);
-      await tgSend(chatId, '🔔 Alert attivati (sell-out + porta se disponibile).');
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/alerts_off')) {
-      alertSubscribers.delete(chatId);
-      await tgSend(chatId, '🔕 Alert disattivati.');
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/debugweeztix')) {
-      const sample = weeztixTicketStats.slice(0, 12)
-        .map(t => `• ${ticketLabel(t.id)} (${t.id.slice(0, 8)}…) | sold=${t.sold} | scanned=${t.scanned}`)
-        .join('\n');
-
-      await tgSend(
-        chatId,
-        `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nTicket rows: ${weeztixTicketStats.length}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}`
-        + `\n\nSample:\n${sample || '(vuoto)'}`
-      );
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/debugweeztix_raw')) {
-      const preview = weeztixLastRaw ? JSON.stringify(weeztixLastRaw, null, 2).slice(0, 3500) : '(vuoto)';
-      await tgSend(chatId, `🧾 WEEZTIX RAW (trimmed)\n\n${preview}`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/biglietti')) {
-      if (!weeztixTicketStats.length) {
-        await tgSend(chatId, `🎟️ Nessun dato ancora.\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
-        return res.sendStatus(200);
-      }
-
-      const { grouped, total } = groupTotals('sold');
-      const lines = Object.entries(grouped).map(([k, v]) => `• ${k}: ${v}`).join('\n');
-
-      let revenue = 0;
-      for (const [label, count] of Object.entries(grouped)) {
-        const p = PRICE_MAP[label];
-        if (typeof p === 'number') revenue += p * Number(count || 0);
-      }
-
-      let soldPctLine = '';
-      if (MP_CAPACITY > 0) {
-        const pct = Math.round((total / MP_CAPACITY) * 100);
-        soldPctLine = `\n📊 Sold-out: ${pct}% (${total}/${MP_CAPACITY})`;
-      }
-
-      await tgSend(
-        chatId,
-        `🎟 BIGLIETTI\n\n${lines}\n\nTotale: ${total}${soldPctLine}\n💸 Revenue stimata: €${revenue.toFixed(2)}\nAggiornato: ${weeztixLastOkAt}`
-      );
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/trend')) {
-      if (statsSeries.length < 2) {
-        await tgSend(chatId, '📈 Trend: serve qualche minuto di dati. Fai /poll_now e riprova tra 2–3 minuti.');
-        return res.sendStatus(200);
-      }
-
-      const now = Date.now();
-      const soldNow = statsSeries[statsSeries.length - 1].soldTotal;
-
-      const findClosest = (msAgo) => {
-        const target = now - msAgo;
-        for (const p of statsSeries) if (p.ts >= target) return p;
-        return statsSeries[0];
-      };
-
-      const p1h = findClosest(60 * 60 * 1000);
-      const p24h = findClosest(24 * 60 * 60 * 1000);
-
-      const delta1h = soldNow - p1h.soldTotal;
-      const delta24h = soldNow - p24h.soldTotal;
-
-      const hoursCovered24 = Math.max(1, (now - p24h.ts) / (60 * 60 * 1000));
-      const avgPerHour24 = delta24h / hoursCovered24;
-
-      let etaLine = '⏳ ETA sold-out: n/d';
-      if (MP_CAPACITY > 0) {
-        const remaining = Math.max(0, MP_CAPACITY - soldNow);
-        const pace = delta1h > 0 ? delta1h : (avgPerHour24 > 0 ? avgPerHour24 : 0);
-
-        if (remaining === 0) etaLine = '🟥 SOLD OUT';
-        else if (pace > 0) {
-          const etaTs = now + (remaining / pace) * 60 * 60 * 1000;
-          etaLine = `⏳ ETA sold-out: ~${new Date(etaTs).toLocaleString('it-BE', { timeZone: 'Europe/Brussels' })} (pace ~${pace.toFixed(1)}/h)`;
-        } else etaLine = '⏳ ETA sold-out: n/d (pace ~0)';
-      }
-
-      await tgSend(
-        chatId,
-        `📈 TREND VENDITE\n` +
-        `Ultima ora: +${delta1h}\n` +
-        `Media (ultime ${hoursCovered24.toFixed(1)}h): ${avgPerHour24.toFixed(1)}/h\n` +
-        `${etaLine}\n` +
-        `Venduti ora: ${soldNow}${MP_CAPACITY ? `/${MP_CAPACITY}` : ''}`
-      );
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/night')) {
-      if (statsSeries.length < 2) {
-        await tgSend(chatId, '🌙 Event Night: serve qualche punto dati. Fai /poll_now e riprova tra 2–3 minuti.');
-        return res.sendStatus(200);
-      }
-
-      const now = Date.now();
-      const last = statsSeries[statsSeries.length - 1];
-
-      const target15 = now - 15 * 60 * 1000;
-      let p15 = null;
-      for (const p of statsSeries) { if (p.ts >= target15) { p15 = p; break; } }
-      p15 = p15 || statsSeries[0];
-
-      const scannedNow = last.scannedTotal || 0;
-      const soldNow = last.soldTotal || 0;
-
-      const delta15 = scannedNow - (p15.scannedTotal || 0);
-      const perHour = delta15 * 4;
-
-      const useProxy = scannedNow === 0;
-      const used = useProxy ? soldNow : scannedNow;
-
-      let capLine = 'Capienza: n/d';
-      if (MP_CAPACITY > 0) capLine = `Capienza: ${Math.round((used / MP_CAPACITY) * 100)}% (${used}/${MP_CAPACITY})`;
-
-      const paceLine = useProxy ? '⚡ Ritmo ingressi: n/d (scanned non disponibile)' : `⚡ Ritmo ingressi (ult 15m): ${delta15} (+${perHour}/h)`;
-      const proxyNote = useProxy ? '\nℹ️ Nota: non vedo “scanned” da Weeztix → uso i venduti come proxy (non ideale per la porta).' : '';
-
-      await tgSend(
-        chatId,
-        `🌙 EVENT NIGHT\n🚪 Entrati: ${useProxy ? 'n/d' : scannedNow}\n🎟 Venduti: ${soldNow}\n${paceLine}\n📊 ${capLine}${proxyNote}`
-      );
-      return res.sendStatus(200);
-    }
-
-    return res.sendStatus(200);
-  } catch (e) {
-    console.error('Telegram webhook error:', e?.response?.data || e.message || e);
-    return res.sendStatus(200);
+async function ensureStatsFresh() {
+  if (lastOkAgeMs() > STATS_MAX_AGE_MS) {
+    console.log('⏳ Cold-start or stale stats → auto-polling now...');
+    await fetchWeeztixStats();
   }
+}
+
+// -------------------- Capacity fetch (best-effort) --------------------
+let weeztixCapByTicketId = {}; // {ticketGuid: totalCapacityNumber}
+let weeztixCapLastOkAt = null;
+let weeztixCapLastError = null;
+let weeztixCapDebug = [];
+
+const CAP_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6h
+
+function capAgeMs() {
+  if (!weeztixCapLastOkAt) return Infinity;
+  const ts = Date.parse(weeztixCapLastOkAt);
+  return Number.isFinite(ts) ? (Date.now() - ts) : Infinity;
+}
+
+function extractTicketArray(obj) {
+  if (!obj) return null;
+  if (Array.isArray(obj)) return obj;
+
+  const candidates = [
+    obj.tickets, obj.ticketTypes, obj.ticket_types, obj.tickettypes,
+    obj.data, obj.results, obj.items
+  ];
+  for (const c of candidates) if (Array.isArray(c)) return c;
+
+  // search shallow keys
+  for (const [k, v] of Object.entries(obj)) {
+    if (Array.isArray(v) && k.toLowerCase().includes('ticket')) return v;
+  }
+  return null;
+}
+
+function extractTicketId(t) {
+  return t?.guid || t?.id || t?.ticket_guid || t?.ticketGuid || t?.ticket_type_guid || t?.ticketTypeGuid || null;
+}
+
+function extractCapacityNumber(t, soldById) {
+  // attempt common total fields
+  const tryFields = [
+    'capacity', 'stock', 'limit', 'max', 'max_sales', 'maxSales',
+    'max_quantity', 'maxQuantity', 'quantity', 'total', 'totalCount'
+  ];
+  for (const f of tryFields) {
+    const v = t?.[f];
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) return v;
+    if (typeof v === 'string' && v.trim() !== '' && !Number.isNaN(Number(v))) return Number(v);
+  }
+
+  // sometimes API returns "available/remaining"; if so, derive total = available + sold (if sold known)
+  const availableFields = ['available', 'availableCount', 'remaining', 'remainingCount'];
+  for (const f of availableFields) {
+    const av = t?.[f];
+    const avNum = (typeof av === 'number') ? av : (!Number.isNaN(Number(av)) ? Number(av) : null);
+    if (avNum != null && avNum >= 0) {
+      const id = extractTicketId(t);
+      const sold = soldById && id ? Number(soldById[id] || 0) : 0;
+      return avNum + sold;
+    }
+  }
+  return null;
+}
+
+async function fetchCapacitiesFromApi() {
+  weeztixCapDebug = [];
+  weeztixCapLastError = null;
+
+  if (!WEEZTIX_EVENT_GUID) {
+    weeztixCapLastError = 'Missing env var: WEEZTIX_EVENT_GUID';
+    return;
+  }
+
+  // Build soldById from latest stats (if any) to help derive totals from "available"
+  const soldById = {};
+  for (const t of weeztixTicketStats) soldById[t.id] = Number(t.sold || 0);
+
+  // Try a set of likely endpoints. We store debug results to help refine quickly.
+  const endpointsToTry = [
+    `/event/${WEEZTIX_EVENT_GUID}`,
+    `/event/${WEEZTIX_EVENT_GUID}/tickets`,
+    `/event/${WEEZTIX_EVENT_GUID}/ticket`,
+    `/event/${WEEZTIX_EVENT_GUID}/tickettypes`,
+    `/event/${WEEZTIX_EVENT_GUID}/ticketTypes`,
+    `/tickets?event_guid=${encodeURIComponent(WEEZTIX_EVENT_GUID)}`,
+    `/ticket?event_guid=${encodeURIComponent(WEEZTIX_EVENT_GUID)}`
+  ];
+
+  for (const path of endpointsToTry) {
+    try {
+      const r = await withRetry(() => weeztixGet(path, { timeout: 20000, companyScoped: true }), { retries: 1, initialDelayMs: 500 });
+      const data = r.data;
+
+      const arr = extractTicketArray(data);
+      weeztixCapDebug.push({ path, ok: true, hasArray: !!arr, topKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 10) : null });
+
+      if (!arr || !arr.length) continue;
+
+      const map = {};
+      for (const t of arr) {
+        const id = extractTicketId(t);
+        if (!id) continue;
+        const cap = extractCapacityNumber(t, soldById);
+        if (cap != null) map[String(id)] = cap;
+      }
+
+      if (Object.keys(map).length) {
+        weeztixCapByTicketId = map;
+        weeztixCapLastOkAt = new Date().toISOString();
+        weeztixCapLastError = null;
+        // persist to Redis
+        await redisSet('weeztix_ticket_capacities', JSON.stringify({ ts: weeztixCapLastOkAt, map }));
+        console.log('📦 Loaded ticket capacities from Weeztix API:', Object.keys(map).length);
+        return;
+      }
+    } catch (e) {
+      weeztixCapDebug.push({ path, ok: false, status: e?.response?.status, msg: e?.message });
+      // continue trying
+    }
+  }
+
+  weeztixCapLastError = 'Could not auto-detect ticket capacities from API (endpoint/fields differ). Use /capacities_debug.';
+}
+
+async function ensureCapacitiesFresh() {
+  if (capAgeMs() <= CAP_CACHE_MAX_AGE_MS && Object.keys(weeztixCapByTicketId).length) return;
+
+  // Try Redis cache first
+  const cached = await redisGet('weeztix_ticket_capacities');
+  if (cached) {
+    try {
+      const obj = JSON.parse(cached);
+      if (obj?.map && typeof obj.map === 'object') {
+        weeztixCapByTicketId = obj.map;
+        weeztixCapLastOkAt = obj.ts || new Date().toISOString();
+        weeztixCapLastError = null;
+        return;
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  // Else fetch from API
+  await fetchCapacitiesFromApi();
+}
+
+// -------------------- Helpers for grouping totals --------------------
+function groupSoldByLabel() {
+  const grouped = {};
+  let total = 0;
+  for (const t of weeztixTicketStats) {
+    const label = ticketLabel(t.id);
+    const v = Number(t.sold || 0);
+    grouped[label] = (grouped[label] || 0) + v;
+    total += v;
+  }
+  return { grouped, total };
+}
+
+function groupCapacityByLabel() {
+  const grouped = {};
+  let total = 0;
+  for (const [ticketId, cap] of Object.entries(weeztixCapByTicketId || {})) {
+    const label = ticketLabel(ticketId);
+    const v = Number(cap || 0);
+    if (!Number.isFinite(v) || v <= 0) continue;
+    grouped[label] = (grouped[label] || 0) + v;
+    total += v;
+  }
+  return { grouped, total };
+}
+
+async function broadcastAlert(message) {
+  const ids = Array.from(alertSubscribers);
+  for (const id of ids) {
+    try {
+      await tgSend(id, message);
+    } catch {
+      alertSubscribers.delete(id);
+    }
+  }
+}
+
+// -------------------- Promo codes (/passwords) --------------------
+function extractCouponTicketGuids(coupon) {
+  const out = new Set();
+
+  const pushGuid = (g) => {
+    if (typeof g === 'string' && g.length >= 30) out.add(g);
+  };
+
+  // common shapes
+  const arrays = [
+    coupon?.ticket_guids,
+    coupon?.ticketGuids,
+    coupon?.tickets,
+    coupon?.ticket_types,
+    coupon?.ticketTypes,
+    coupon?.discounted_products,
+    coupon?.discountedProducts,
+    coupon?.applies_to_ticket_guids,
+    coupon?.appliesToTicketGuids,
+    coupon?.applies_to,
+    coupon?.appliesTo
+  ];
+
+  for (const a of arrays) {
+    if (Array.isArray(a)) {
+      for (const x of a) {
+        if (typeof x === 'string') pushGuid(x);
+        else pushGuid(x?.guid || x?.id || x?.ticket_guid || x?.ticketGuid);
+      }
+    }
+  }
+
+  // single fields
+  pushGuid(coupon?.ticket_guid);
+  pushGuid(coupon?.ticketGuid);
+
+  return Array.from(out);
+}
+
+function extractCouponCodesFromObject(coupon) {
+  const out = [];
+  const candidates = [
+    coupon?.codes,
+    coupon?.couponCodes,
+    coupon?.coupon_codes,
+    coupon?.couponcodes
+  ];
+  for (const c of candidates) {
+    if (Array.isArray(c)) {
+      for (const x of c) {
+        if (typeof x === 'string') out.push(x);
+        else if (typeof x?.code === 'string') out.push(x.code);
+      }
+    }
+  }
+  return out;
+}
+
+async function fetchCouponCodesBestEffort(couponGuid) {
+  // Try a few likely endpoints; docs show POST/PUT on /coupon/:guid/codes, but GET may still exist server-side. [4](https://docs.weeztix.com/api/dashboard/add-coupon-codes/)[5](https://docs.weeztix.com/api/dashboard/generate-coupon-codes/)
+  const paths = [
+    `/coupon/${couponGuid}`,           // maybe contains embedded codes
+    `/coupon/${couponGuid}/codes`,     // common
+    `/coupon/${couponGuid}/couponcodes`,
+    `/coupon/${couponGuid}/couponCodes`
+  ];
+
+  for (const p of paths) {
+    try {
+      const r = await weeztixGet(p, { timeout: 20000, companyScoped: true });
+      const data = r.data;
+
+      // If this is the coupon itself, codes might be embedded
+      if (p === `/coupon/${couponGuid}`) {
+        const embedded = extractCouponCodesFromObject(data);
+        if (embedded.length) return embedded;
+      }
+
+      // Or the endpoint returns an array of coupon codes
+      if (Array.isArray(data)) {
+        const codes = data.map(x => (typeof x === 'string' ? x : x?.code)).filter(Boolean);
+        if (codes.length) return codes;
+      }
+
+      // Or nested in common keys
+      const nested = extractCouponCodesFromObject(data);
+      if (nested.length) return nested;
+      if (Array.isArray(data?.results)) {
+        const codes = data.results.map(x => x?.code).filter(Boolean);
+        if (codes.length) return codes;
+      }
+    } catch (e) {
+      // keep trying
+    }
+  }
+  return [];
+}
+
+function isCouponEnabled(c) {
+  // heuristic; different backends use different flags
+  const status = String(c?.status || c?.state || '').toLowerCase();
+  if (status && (status.includes('disabled') || status.includes('archived') || status.includes('trashed'))) return false;
+  if (c?.deleted_at || c?.deletedAt || c?.archived_at || c?.archivedAt) return false;
+  if (typeof c?.enabled === 'boolean') return c.enabled;
+  if (typeof c?.active === 'boolean') return c.active;
+  if (typeof c?.isActive === 'boolean') return c.isActive;
+  return true; // default optimistic
+}
+
+async function handlePasswordsCommand(chatId) {
+  await ensureAccessToken();
+  await fetchCompanyGuidIfNeeded();
+
+  // Get coupons (campaigns). Endpoint exists. [3](https://docs.weeztix.com/api/dashboard/get-coupons/)
+  let coupons = [];
+  try {
+    // /coupon/{type?} supports normal/trashed/justtrashed, default normal in docs [3](https://docs.weeztix.com/api/dashboard/get-coupons/)
+    const r = await weeztixGet('/coupon/normal', { timeout: 25000, companyScoped: true });
+    coupons = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.results) ? r.data.results : []);
+  } catch (e) {
+    // fallback without /normal
+    try {
+      const r2 = await weeztixGet('/coupon', { timeout: 25000, companyScoped: true });
+      coupons = Array.isArray(r2.data) ? r2.data : (Array.isArray(r2.data?.results) ? r2.data.results : []);
+    } catch (e2) {
+      const detail = e2?.response?.data ? JSON.stringify(e2.response.data).slice(0, 1200) : (e2?.message || String(e2));
+      await tgSend(chatId, `❌ /passwords: impossibile leggere i coupon.\nDettagli: ${detail}`);
+      return;
+    }
+  }
+
+  coupons = coupons.filter(isCouponEnabled);
+
+  if (!coupons.length) {
+    await tgSend(chatId, '🔑 /passwords\nNessun promo code/coupon attivo trovato.');
+    return;
+  }
+
+  const lines = [];
+  lines.push('🔑 PASSWORDS (promo codes attivi)\n');
+
+  // Build mapping from coupon -> codes + ticket labels
+  for (const c of coupons) {
+    const guid = c?.guid || c?.id;
+    const name = c?.name || c?.title || c?.description || '(coupon)';
+    const ticketGuids = extractCouponTicketGuids(c);
+    const ticketLabels = ticketGuids.length ? Array.from(new Set(ticketGuids.map(ticketLabel))) : [];
+
+    let codes = extractCouponCodesFromObject(c);
+
+    if (!codes.length && guid) {
+      // try fetching codes/detail
+      codes = await fetchCouponCodesBestEffort(guid);
+    }
+
+    // If still no codes, show campaign name only
+    if (!codes.length) {
+      lines.push(`• (campagna) ${name}${ticketLabels.length ? ` → ${ticketLabels.join(', ')}` : ''}`);
+      continue;
+    }
+
+    // One line per code
+    for (const code of codes) {
+      lines.push(`• ${code} — ${name}${ticketLabels.length ? ` → ${ticketLabels.join(', ')}` : ''}`);
+    }
+  }
+
+  lines.push('\nℹ️ Nota: associazione ticket↔coupon è “best-effort” (dipende dai campi esposti dall’API).');
+
+  await tgSendLong(chatId, lines.join('\n'));
+}
+
+// -------------------- Telegram webhook (ACK immediately, process async) --------------------
+app.post('/webhook', (req, res) => {
+  // Always ACK fast to avoid Telegram timeouts on Render cold-start
+  res.sendStatus(200);
+
+  setImmediate(async () => {
+    try {
+      const msg = req.body.message;
+      if (!msg) return;
+
+      const chatId = msg.chat.id;
+      const text = (msg.text || '').trim();
+
+      if (text === '/whoami') {
+        await tgSend(chatId, `🆔 Il tuo chat ID è: ${chatId}`);
+        return;
+      }
+
+      if (text.startsWith('/auth_check')) {
+        try {
+          await refreshAccessToken();
+          await tgSend(chatId, '✅ OAuth OK: access token ottenuto.');
+        } catch (e) {
+          const detail = e?.response?.data ? JSON.stringify(e.response.data) : (e?.message || String(e));
+          await tgSend(chatId, `❌ OAuth FAIL: ${detail}`);
+        }
+        return;
+      }
+
+      if (text.startsWith('/poll_now')) {
+        await fetchWeeztixStats();
+        await tgSend(chatId, `✅ Poll fatto.\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
+        return;
+      }
+
+      if (text.startsWith('/alerts_on')) {
+        alertSubscribers.add(chatId);
+        await tgSend(chatId, '🔔 Alert attivati (sell-out + porta se disponibile).');
+        return;
+      }
+
+      if (text.startsWith('/alerts_off')) {
+        alertSubscribers.delete(chatId);
+        await tgSend(chatId, '🔕 Alert disattivati.');
+        return;
+      }
+
+      if (text.startsWith('/event_raw')) {
+        // Debug: fetch event object (best-effort)
+        if (!WEEZTIX_EVENT_GUID) {
+          await tgSend(chatId, '❌ Missing WEEZTIX_EVENT_GUID');
+          return;
+        }
+        try {
+          const r = await weeztixGet(`/event/${WEEZTIX_EVENT_GUID}`, { timeout: 25000, companyScoped: true });
+          const preview = JSON.stringify(r.data, null, 2).slice(0, 3500);
+          await tgSend(chatId, `🧾 EVENT RAW (trimmed)\n\n${preview}`);
+        } catch (e) {
+          const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 1200) : (e?.message || String(e));
+          await tgSend(chatId, `❌ /event_raw failed: ${detail}`);
+        }
+        return;
+      }
+
+      if (text.startsWith('/capacities_debug')) {
+        await ensureStatsFresh();     // helps derive totals if only "available" is present
+        await ensureCapacitiesFresh();
+        const mapKeys = Object.keys(weeztixCapByTicketId || {});
+        const sample = mapKeys.slice(0, 15).map(k => `• ${ticketLabel(k)} (${k.slice(0, 8)}…): cap=${weeztixCapByTicketId[k]}`).join('\n');
+        const dbg = JSON.stringify(weeztixCapDebug, null, 2).slice(0, 2500);
+        await tgSendLong(chatId,
+          `🧪 CAPACITIES DEBUG\nUltimo OK cap: ${weeztixCapLastOkAt || 'mai'}\nErrore cap: ${weeztixCapLastError || '—'}\nEntries: ${mapKeys.length}\n\nSample:\n${sample || '(vuoto)'}\n\nTried endpoints:\n${dbg}`
+        );
+        return;
+      }
+
+      if (text.startsWith('/debugweeztix')) {
+        await ensureStatsFresh();
+        const sample = weeztixTicketStats.slice(0, 12)
+          .map(t => `• ${ticketLabel(t.id)} (${t.id.slice(0, 8)}…) | sold=${t.sold} | scanned=${t.scanned}`)
+          .join('\n');
+
+        await tgSend(
+          chatId,
+          `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nTicket rows: ${weeztixTicketStats.length}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}`
+          + `\n\nSample:\n${sample || '(vuoto)'}`
+        );
+        return;
+      }
+
+      if (text.startsWith('/debugweeztix_raw')) {
+        await ensureStatsFresh();
+        const preview = weeztixLastRaw ? JSON.stringify(weeztixLastRaw, null, 2).slice(0, 3500) : '(vuoto)';
+        await tgSend(chatId, `🧾 WEEZTIX RAW (trimmed)\n\n${preview}`);
+        return;
+      }
+
+      if (text.startsWith('/passwords')) {
+        await handlePasswordsCommand(chatId);
+        return;
+      }
+
+      if (text.startsWith('/biglietti')) {
+        // Cold-start fix: auto poll
+        await ensureStatsFresh();
+        // Capacities: best-effort (non-fatal)
+        await ensureCapacitiesFresh();
+
+        if (!weeztixTicketStats.length) {
+          await tgSend(chatId, `🎟️ Nessun dato ancora.\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
+          return;
+        }
+
+        const { grouped: soldByLabel, total: soldTotal } = groupSoldByLabel();
+        const { grouped: capByLabel } = groupCapacityByLabel();
+
+        // Lines: sold + remaining if capacity known
+        const labels = Object.keys(soldByLabel);
+        labels.sort((a, b) => a.localeCompare(b, 'it'));
+
+        const lines = labels.map(label => {
+          const sold = soldByLabel[label] || 0;
+          const cap = capByLabel[label];
+          if (typeof cap === 'number' && cap > 0) {
+            const remaining = Math.max(0, cap - sold);
+            return `• ${label}: sold=${sold} | remaining=${remaining}/${cap}`;
+          }
+          return `• ${label}: sold=${sold} | remaining=n/d`;
+        }).join('\n');
+
+        // Revenue estimate
+        let revenue = 0;
+        for (const [label, count] of Object.entries(soldByLabel)) {
+          const p = PRICE_MAP[label];
+          if (typeof p === 'number') revenue += p * Number(count || 0);
+        }
+
+        let soldPctLine = '';
+        if (MP_CAPACITY > 0) {
+          const pct = Math.round((soldTotal / MP_CAPACITY) * 100);
+          soldPctLine = `\n📊 Sold-out: ${pct}% (${soldTotal}/${MP_CAPACITY})`;
+        }
+
+        const capNote = (Object.keys(weeztixCapByTicketId || {}).length)
+          ? ''
+          : '\nℹ️ Capacità per wave non trovata via API → remaining=n/d. Usa /capacities_debug per diagnosticare.';
+
+        await tgSend(
+          chatId,
+          `🎟 BIGLIETTI\n\n${lines}\n\nTotale sold: ${soldTotal}${soldPctLine}\n💸 Revenue stimata: €${revenue.toFixed(2)}\nAggiornato: ${weeztixLastOkAt}${capNote}`
+        );
+        return;
+      }
+
+      if (text.startsWith('/trend')) {
+        await ensureStatsFresh();
+
+        if (statsSeries.length < 2) {
+          await tgSend(chatId, '📈 Trend: serve qualche minuto di dati. Fai /poll_now e riprova tra 2–3 minuti.');
+          return;
+        }
+
+        const now = Date.now();
+        const soldNow = statsSeries[statsSeries.length - 1].soldTotal;
+
+        const findClosest = (msAgo) => {
+          const target = now - msAgo;
+          for (const p of statsSeries) if (p.ts >= target) return p;
+          return statsSeries[0];
+        };
+
+        const p1h = findClosest(60 * 60 * 1000);
+        const p24h = findClosest(24 * 60 * 60 * 1000);
+
+        const delta1h = soldNow - p1h.soldTotal;
+        const delta24h = soldNow - p24h.soldTotal;
+
+        const hoursCovered24 = Math.max(1, (now - p24h.ts) / (60 * 60 * 1000));
+        const avgPerHour24 = delta24h / hoursCovered24;
+
+        let etaLine = '⏳ ETA sold-out: n/d';
+        if (MP_CAPACITY > 0) {
+          const remaining = Math.max(0, MP_CAPACITY - soldNow);
+          const pace = delta1h > 0 ? delta1h : (avgPerHour24 > 0 ? avgPerHour24 : 0);
+
+          if (remaining === 0) etaLine = '🟥 SOLD OUT';
+          else if (pace > 0) {
+            const etaTs = now + (remaining / pace) * 60 * 60 * 1000;
+            etaLine = `⏳ ETA sold-out: ~${new Date(etaTs).toLocaleString('it-BE', { timeZone: 'Europe/Brussels' })} (pace ~${pace.toFixed(1)}/h)`;
+          } else etaLine = '⏳ ETA sold-out: n/d (pace ~0)';
+        }
+
+        await tgSend(
+          chatId,
+          `📈 TREND VENDITE\n` +
+          `Ultima ora: +${delta1h}\n` +
+          `Media (ultime ${hoursCovered24.toFixed(1)}h): ${avgPerHour24.toFixed(1)}/h\n` +
+          `${etaLine}\n` +
+          `Venduti ora: ${soldNow}${MP_CAPACITY ? `/${MP_CAPACITY}` : ''}`
+        );
+        return;
+      }
+
+      if (text.startsWith('/night')) {
+        await ensureStatsFresh();
+
+        if (statsSeries.length < 2) {
+          await tgSend(chatId, '🌙 Event Night: serve qualche punto dati. Fai /poll_now e riprova tra 2–3 minuti.');
+          return;
+        }
+
+        const now = Date.now();
+        const last = statsSeries[statsSeries.length - 1];
+
+        const target15 = now - 15 * 60 * 1000;
+        let p15 = null;
+        for (const p of statsSeries) { if (p.ts >= target15) { p15 = p; break; } }
+        p15 = p15 || statsSeries[0];
+
+        const scannedNow = last.scannedTotal || 0;
+        const soldNow = last.soldTotal || 0;
+
+        const delta15 = scannedNow - (p15.scannedTotal || 0);
+        const perHour = delta15 * 4;
+
+        const useProxy = scannedNow === 0;
+        const used = useProxy ? soldNow : scannedNow;
+
+        let capLine = 'Capienza: n/d';
+        if (MP_CAPACITY > 0) capLine = `Capienza: ${Math.round((used / MP_CAPACITY) * 100)}% (${used}/${MP_CAPACITY})`;
+
+        const paceLine = useProxy ? '⚡ Ritmo ingressi: n/d (scanned non disponibile)' : `⚡ Ritmo ingressi (ult 15m): ${delta15} (+${perHour}/h)`;
+        const proxyNote = useProxy ? '\nℹ️ Nota: non vedo “scanned” da Weeztix → uso i venduti come proxy (non ideale per la porta).' : '';
+
+        await tgSend(
+          chatId,
+          `🌙 EVENT NIGHT\n🚪 Entrati: ${useProxy ? 'n/d' : scannedNow}\n🎟 Venduti: ${soldNow}\n${paceLine}\n📊 ${capLine}${proxyNote}`
+        );
+        return;
+      }
+
+      // Default: ignore unknown commands
+    } catch (e) {
+      console.error('Telegram webhook async error:', e?.response?.data || e.message || e);
+      try {
+        if (ADMIN_CHAT_ID) await tgSend(ADMIN_CHAT_ID, `⚠️ Bot error: ${e?.message || String(e)}`);
+      } catch (_) {}
+    }
+  });
 });
 
+// -------------------- Root --------------------
 app.get('/', (req, res) => {
   res.send('MP Telegram Bot is running 🇮🇹');
 });
