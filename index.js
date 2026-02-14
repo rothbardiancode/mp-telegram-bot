@@ -651,6 +651,11 @@ if (
   derived = false;
 }
 
+ // HARD OVERRIDE: in this tenant, available_stock is TOTAL capacity, never remaining.
+if (pl.includes('available_stock')) {
+  cap = Number(best.value);
+  derived = false;
+}
   if (!Number.isFinite(cap) || cap < 0) return { cap: null, meta: null };
 
   return {
