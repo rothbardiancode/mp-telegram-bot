@@ -322,6 +322,10 @@ const WEEZTIX_EVENT_GUID_RAW = (process.env.WEEZTIX_EVENT_GUID || '').trim();
 const [WEEZTIX_EVENT_GUID_CLEAN, EMBEDDED_QS_PART] = WEEZTIX_EVENT_GUID_RAW.split('?');
 const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
 
+// NIGHT event (env var has a typo: WEEZITX not WEEZTIX)
+const WEEZTIX_EVENT_GUID_NIGHT_RAW = (process.env.WEEZITX_EVENT_GUID_NIGHT || '').trim();
+const WEEZTIX_EVENT_GUID_NIGHT = WEEZTIX_EVENT_GUID_NIGHT_RAW.split('?')[0];
+
 const WEEZTIX_AS = (process.env.WEEZTIX_AS || '').trim();
 const AS_QS = WEEZTIX_AS ? `?as=${encodeURIComponent(WEEZTIX_AS)}` : '';
 
@@ -700,67 +704,70 @@ async function fetchCapacitiesFromApi() {
   const qs = qsForDashboard();
   const join = qs ? '&' : '?';
 
-  // Your tenant: /event/{guid}/ticket works; /event/{guid}/tickets may 404.
-  const endpointsToTry = [
-    `/event/${WEEZTIX_EVENT_GUID}/ticket${qs}`,
-    `/event/${WEEZTIX_EVENT_GUID}/tickets${qs}`,
-    `/ticket${qs}${join}event_guid=${encodeURIComponent(WEEZTIX_EVENT_GUID)}`,
-    `/event/${WEEZTIX_EVENT_GUID}${qs}`
-  ];
+  const eventGuids = [WEEZTIX_EVENT_GUID, ...(WEEZTIX_EVENT_GUID_NIGHT ? [WEEZTIX_EVENT_GUID_NIGHT] : [])];
 
-  for (const path of endpointsToTry) {
-    try {
-      const r = await withRetry(
-        () => weeztixGet(path, { timeout: 20000, companyScoped: true }),
-        { retries: 1, initialDelayMs: 500 }
-      );
+  const combinedMap = {};
+  const combinedMetaMap = {};
+  const combinedNameById = {};
+  const combinedPriceById = {};
 
-      const data = r.data;
-      const arr = extractTicketArray(data);
+  for (const guid of eventGuids) {
+    const pathsToTry = [
+      `/event/${guid}/ticket${qs}`,
+      `/event/${guid}/tickets${qs}`,
+    ];
 
-      weeztixCapDebug.push({
-        path,
-        ok: true,
-        hasArray: !!arr,
-        topKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 12) : null
-      });
+    for (const path of pathsToTry) {
+      try {
+        const r = await withRetry(
+          () => weeztixGet(path, { timeout: 20000, companyScoped: true }),
+          { retries: 1, initialDelayMs: 500 }
+        );
 
-      if (!arr || !arr.length) continue;
+        const data = r.data;
+        const arr = extractTicketArray(data);
 
-      const map = {};
-      const metaMap = {};
+        weeztixCapDebug.push({
+          path,
+          ok: true,
+          hasArray: !!arr,
+          topKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 12) : null
+        });
 
-      const nameById = {};
-      const priceById = {};
+        if (!arr || !arr.length) continue;
 
-      for (const t of arr) {
-        const id = extractTicketId(t);
-        if (!id) continue;
+        for (const t of arr) {
+          const id = extractTicketId(t);
+          if (!id) continue;
 
-        if (t.name) nameById[String(id)] = t.name;
-        if (typeof t.min_price === 'number') priceById[String(id)] = t.min_price / 100;
+          if (t.name) combinedNameById[String(id)] = t.name;
+          if (typeof t.min_price === 'number') combinedPriceById[String(id)] = t.min_price / 100;
 
-        const { cap, meta } = extractCapacityDeep(t, soldById);
-        if (cap != null) {
-          map[String(id)] = cap;
-          if (meta) metaMap[String(id)] = meta;
+          const { cap, meta } = extractCapacityDeep(t, soldById);
+          if (cap != null) {
+            combinedMap[String(id)] = cap;
+            if (meta) combinedMetaMap[String(id)] = meta;
+          }
         }
-      }
 
-      if (Object.keys(map).length) {
-        weeztixCapByTicketId = map;
-        weeztixCapMetaByTicketId = metaMap;
-        Object.assign(weeztixTicketNameById, nameById);
-        Object.assign(weeztixTicketPriceById, priceById);
-        weeztixCapLastOkAt = new Date().toISOString();
-        weeztixCapLastError = null;
-
-        await redisSet('weeztix_ticket_capacities', JSON.stringify({ ts: weeztixCapLastOkAt, map, metaMap, nameById, priceById }));
-        return;
+        // Got data for this event; skip the fallback path for this guid
+        break;
+      } catch (e) {
+        weeztixCapDebug.push({ path, ok: false, status: e?.response?.status, msg: e?.message });
       }
-    } catch (e) {
-      weeztixCapDebug.push({ path, ok: false, status: e?.response?.status, msg: e?.message });
     }
+  }
+
+  if (Object.keys(combinedNameById).length || Object.keys(combinedMap).length) {
+    weeztixCapByTicketId = combinedMap;
+    weeztixCapMetaByTicketId = combinedMetaMap;
+    Object.assign(weeztixTicketNameById, combinedNameById);
+    Object.assign(weeztixTicketPriceById, combinedPriceById);
+    weeztixCapLastOkAt = new Date().toISOString();
+    weeztixCapLastError = null;
+
+    await redisSet('weeztix_ticket_capacities', JSON.stringify({ ts: weeztixCapLastOkAt, map: combinedMap, metaMap: combinedMetaMap, nameById: combinedNameById, priceById: combinedPriceById }));
+    return;
   }
 
   weeztixCapLastError = 'Could not auto-detect ticket capacities from API (endpoint/fields differ). Use /ticket_raw + /capacities_debug.';
@@ -940,23 +947,30 @@ async function handlePasswordsCommand(chatId) {
 
 // -------------------- Debug helpers --------------------
 async function handleTicketRaw(chatId) {
-  try {
-    const r = await weeztixGet(`/event/${WEEZTIX_EVENT_GUID}/ticket${qsForDashboard()}`, { timeout: 25000, companyScoped: true });
-    const arr = extractTicketArray(r.data) || [];
-    if (arr.length) {
-      const lines = arr.map(t => {
-        const id = extractTicketId(t);
-        const price = typeof t.min_price === 'number' ? `€${(t.min_price / 100).toFixed(2)}` : 'n/d';
-        return `• ${t.name || '?'} | ${id || '?'} | stock=${t.available_stock ?? 'n/d'} | price=${price}`;
-      }).join('\n');
-      await tgSend(chatId, `🧾 TICKET LIST (${arr.length} types)\n\n${lines}`);
-    } else {
-      const preview = JSON.stringify(r.data, null, 2).slice(0, 3500);
-      await tgSend(chatId, `🧾 TICKET RAW (no array found)\n\n${preview}`);
+  const qs = qsForDashboard();
+  const events = [
+    { label: 'BRUNCH', guid: WEEZTIX_EVENT_GUID },
+    ...(WEEZTIX_EVENT_GUID_NIGHT ? [{ label: 'NIGHT', guid: WEEZTIX_EVENT_GUID_NIGHT }] : [])
+  ];
+  for (const { label, guid } of events) {
+    try {
+      const r = await weeztixGet(`/event/${guid}/ticket${qs}`, { timeout: 25000, companyScoped: true });
+      const arr = extractTicketArray(r.data) || [];
+      if (arr.length) {
+        const lines = arr.map(t => {
+          const id = extractTicketId(t);
+          const price = typeof t.min_price === 'number' ? `€${(t.min_price / 100).toFixed(2)}` : 'n/d';
+          return `• ${t.name || '?'} | ${id || '?'} | stock=${t.available_stock ?? 'n/d'} | price=${price}`;
+        }).join('\n');
+        await tgSend(chatId, `🧾 TICKET LIST – ${label} (${arr.length} types)\n\n${lines}`);
+      } else {
+        const preview = JSON.stringify(r.data, null, 2).slice(0, 3500);
+        await tgSend(chatId, `🧾 TICKET RAW – ${label} (no array found)\n\n${preview}`);
+      }
+    } catch (e) {
+      const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 1200) : (e?.message || String(e));
+      await tgSend(chatId, `❌ /ticket_raw ${label} failed: ${detail}`);
     }
-  } catch (e) {
-    const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 1200) : (e?.message || String(e));
-    await tgSend(chatId, `❌ /ticket_raw failed: ${detail}`);
   }
 }
 
