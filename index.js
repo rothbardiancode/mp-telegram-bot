@@ -748,7 +748,8 @@ async function fetchCapacitiesFromApi() {
           const id = extractTicketId(t);
           if (!id) continue;
 
-          if (t.name) combinedNameById[String(id)] = isNight ? `${t.name} (Night)` : t.name;
+          const tName = t.name || t.title || t.label;
+          if (tName) combinedNameById[String(id)] = isNight ? `${tName} (Night)` : tName;
           if (typeof t.min_price === 'number') combinedPriceById[String(id)] = t.min_price / 100;
 
           const { cap, meta } = extractCapacityDeep(t, soldById);
@@ -1156,7 +1157,7 @@ app.post('/webhook', (req, res) => {
 
         await tgSend(
           chatId,
-          `🎟 BIGLIETTI\n\n${lines}\n\nTotale sold: ${soldTotal}${soldPctLine}\n💸 Revenue stimata: €${revenue.toFixed(2)}\nAggiornato: ${weeztixLastOkAt}${capNote}`
+          `🎟 BIGLIETTI\n\n${lines}\n\nTotale sold: ${soldTotal}${soldPctLine}\n💸 Revenue stimata: €${revenue.toFixed(2)}\nAggiornato: ${weeztixLastOkAt || weeztixCapLastOkAt}${capNote}`
         );
         return;
       }
