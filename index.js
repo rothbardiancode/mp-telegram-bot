@@ -322,8 +322,8 @@ const WEEZTIX_EVENT_GUID_RAW = (process.env.WEEZTIX_EVENT_GUID || '').trim();
 const [WEEZTIX_EVENT_GUID_CLEAN, EMBEDDED_QS_PART] = WEEZTIX_EVENT_GUID_RAW.split('?');
 const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
 
-// NIGHT event (env var has a typo: WEEZITX not WEEZTIX)
-const WEEZTIX_EVENT_GUID_NIGHT_RAW = (process.env.WEEZITX_EVENT_GUID_NIGHT || '').trim();
+// NIGHT event
+const WEEZTIX_EVENT_GUID_NIGHT_RAW = (process.env.WEEZTIX_EVENT_GUID_NIGHT || '').trim();
 const WEEZTIX_EVENT_GUID_NIGHT = WEEZTIX_EVENT_GUID_NIGHT_RAW.split('?')[0];
 
 const WEEZTIX_AS = (process.env.WEEZTIX_AS || '').trim();
