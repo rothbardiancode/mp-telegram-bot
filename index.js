@@ -314,19 +314,36 @@ async function ensureAccessToken() {
   if (!WEEZTIX_ACCESS_TOKEN) await refreshAccessToken();
 }
 
-// -------------------- Robust parsing of WEEZTIX_EVENT_GUID + ?as=... --------------------
-const WEEZTIX_EVENT_GUID_RAW = (process.env.WEEZTIX_EVENT_GUID || '').trim();
-const [WEEZTIX_EVENT_GUID_CLEAN, EMBEDDED_QS_PART] = WEEZTIX_EVENT_GUID_RAW.split('?');
-const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
+// -------------------- Event config (multi-event support) --------------------
+function parseEventGuid(raw) {
+  const trimmed = (raw || '').trim();
+  const [guid, qsPart] = trimmed.split('?');
+  return { guid: guid || '', embeddedQs: qsPart ? `?${qsPart}` : '' };
+}
 
 const WEEZTIX_AS = (process.env.WEEZTIX_AS || '').trim();
 const AS_QS = WEEZTIX_AS ? `?as=${encodeURIComponent(WEEZTIX_AS)}` : '';
 
-function qsForDashboard() {
-  return AS_QS || EMBEDDED_QS || '';
+function qsForDashboard(embeddedQs = '') {
+  return AS_QS || embeddedQs || '';
 }
 
-const WEEZTIX_EVENT_GUID = WEEZTIX_EVENT_GUID_CLEAN;
+const WEEZTIX_EVENTS = (() => {
+  const events = [];
+  const brunch = parseEventGuid(process.env.WEEZTIX_EVENT_GUID_BRUNCH);
+  const night  = parseEventGuid(process.env.WEEZTIX_EVENT_GUID_NIGHT);
+  if (brunch.guid) events.push({ key: 'brunch', label: 'BRUNCH', guid: brunch.guid, embeddedQs: brunch.embeddedQs });
+  if (night.guid)  events.push({ key: 'night',  label: 'NIGHT',  guid: night.guid,  embeddedQs: night.embeddedQs });
+  // backward compat: fall back to legacy single var if neither new var is set
+  if (!events.length) {
+    const legacy = parseEventGuid(process.env.WEEZTIX_EVENT_GUID);
+    if (legacy.guid) events.push({ key: 'event', label: 'EVENT', guid: legacy.guid, embeddedQs: legacy.embeddedQs });
+  }
+  return events;
+})();
+
+// Keep for code paths that still need a single GUID (capacity fetch, etc.)
+const WEEZTIX_EVENT_GUID = WEEZTIX_EVENTS[0]?.guid || '';
 
 // -------------------- API base --------------------
 const WEEZTIX_API_BASE = process.env.WEEZTIX_API_BASE || 'https://api.weeztix.com';
@@ -390,8 +407,9 @@ async function weeztixGet(path, { timeout = 20000, companyScoped = false } = {})
 // -------------------- Stats polling --------------------
 let weeztixLastOkAt = null;
 let weeztixLastError = null;
-let weeztixLastRaw = null;
-let weeztixTicketStats = []; // [{id, sold, scanned}]
+let weeztixLastRaw = {};        // { [eventKey]: rawApiResponse }
+let weeztixEventStats = {};     // { [eventKey]: [{id, sold, scanned}] }
+let weeztixTicketStats = [];    // merged flat array (used for alerts/trend)
 
 const statsSeries = []; // [{ts, soldTotal, scannedTotal}]
 const SERIES_KEEP_MS = 48 * 60 * 60 * 1000;
@@ -445,45 +463,63 @@ function parseWeeztixStats(data) {
 
 async function fetchWeeztixStats() {
   try {
-    if (!WEEZTIX_EVENT_GUID) {
-      weeztixLastError = 'Missing WEEZTIX_EVENT_GUID';
+    if (!WEEZTIX_EVENTS.length) {
+      weeztixLastError = 'Missing WEEZTIX_EVENT_GUID_BRUNCH / WEEZTIX_EVENT_GUID_NIGHT';
       return;
     }
 
-    const statsUrl = `https://api.weeztix.com/statistics/dashboard/${WEEZTIX_EVENT_GUID}${qsForDashboard()}`;
-
-    const callApi = async () => {
-      await ensureAccessToken();
-      return axios.get(statsUrl, {
-        headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
-        timeout: 30000
-      });
+    const fetchOne = async (ev) => {
+      const statsUrl = `https://api.weeztix.com/statistics/dashboard/${ev.guid}${qsForDashboard(ev.embeddedQs)}`;
+      const callApi = async () => {
+        await ensureAccessToken();
+        return axios.get(statsUrl, {
+          headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
+          timeout: 30000
+        });
+      };
+      try {
+        return await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+      } catch (e) {
+        const status = e?.response?.status;
+        const msg = e?.response?.data?.error_description || '';
+        if (status === 401 || (status === 400 && msg.includes('JWT'))) {
+          await refreshAccessToken();
+          return await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+        }
+        throw e;
+      }
     };
 
-    let resp;
-    try {
-      resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
-    } catch (e) {
-      const status = e?.response?.status;
-      const msg = e?.response?.data?.error_description || '';
-      if (status === 401 || (status === 400 && msg.includes('JWT'))) {
-        await refreshAccessToken();
-        resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+    const results = await Promise.allSettled(WEEZTIX_EVENTS.map(fetchOne));
+
+    const newEventStats = {};
+    const newLastRaw = {};
+    const errors = [];
+
+    for (let i = 0; i < WEEZTIX_EVENTS.length; i++) {
+      const ev = WEEZTIX_EVENTS[i];
+      const result = results[i];
+      if (result.status === 'fulfilled') {
+        newLastRaw[ev.key] = result.value.data ?? { _empty: true };
+        newEventStats[ev.key] = parseWeeztixStats(result.value.data);
       } else {
-        throw e;
+        errors.push(`${ev.label}: ${result.reason?.message || result.reason}`);
+        newLastRaw[ev.key] = { _error: String(result.reason?.message || result.reason) };
+        newEventStats[ev.key] = weeztixEventStats[ev.key] || []; // keep stale
       }
     }
 
-    weeztixLastRaw = resp.data ?? { _empty: true };
-    const parsed = parseWeeztixStats(resp.data);
-    if (!parsed.length) {
-      weeztixLastError = 'Stats fetched but parsing returned empty';
+    weeztixLastRaw = newLastRaw;
+    weeztixEventStats = newEventStats;
+    weeztixTicketStats = Object.values(newEventStats).flat();
+
+    if (!weeztixTicketStats.length) {
+      weeztixLastError = errors.length ? errors.join('; ') : 'Stats fetched but parsing returned empty';
       return;
     }
 
-    weeztixTicketStats = parsed;
     weeztixLastOkAt = new Date().toISOString();
-    weeztixLastError = null;
+    weeztixLastError = errors.length ? `Partial errors: ${errors.join('; ')}` : null;
 
     const soldTotalNow = weeztixTicketStats.reduce((sum, t) => sum + (Number(t.sold) || 0), 0);
     const scannedTotalNow = weeztixTicketStats.reduce((sum, t) => sum + (Number(t.scanned) || 0), 0);
@@ -629,15 +665,15 @@ function extractCapacityDeep(ticketObj, soldById) {
 
   const pl = best.path.toLowerCase();
   // ✅ HARD EARLY RETURN: in this tenant, available_stock is TOTAL capacity, never remaining.
-// This prevents any later logic from setting derived=true or altering cap.
-if (pl.includes('available_stock')) {
-  const cap = Number(best.value);
-  if (!Number.isFinite(cap) || cap < 0) return { cap: null, meta: null };
-  return {
-    cap,
-    meta: { fieldPath: best.path, rawValue: best.value, derived: false }
-  };
-}
+  // This prevents any later logic from setting derived=true or altering cap.
+  if (pl.includes('available_stock')) {
+    const cap = Number(best.value);
+    if (!Number.isFinite(cap) || cap < 0) return { cap: null, meta: null };
+    return {
+      cap,
+      meta: { fieldPath: best.path, rawValue: best.value, derived: false }
+    };
+  }
 
   let cap = Number(best.value);
   let derived = false;
@@ -674,7 +710,7 @@ async function fetchCapacitiesFromApi() {
   const soldById = {};
   for (const t of weeztixTicketStats) soldById[t.id] = Number(t.sold || 0);
 
-  const qs = qsForDashboard();
+  const qs = qsForDashboard(WEEZTIX_EVENTS[0]?.embeddedQs || '');
   const join = qs ? '&' : '?';
 
   // Your tenant: /event/{guid}/ticket works; /event/{guid}/tickets may 404.
@@ -993,23 +1029,31 @@ app.post('/webhook', (req, res) => {
       }
 
       // --- debugging ---
-      if (text.startsWith('/debugweeztix')) {
+      if (text.startsWith('/debugweeztix_raw')) {
         await ensureStatsFresh();
-        const sample = weeztixTicketStats.slice(0, 12)
-          .map(t => `• ${ticketLabel(t.id)} (${t.id.slice(0, 8)}…) | sold=${t.sold} | scanned=${t.scanned}`)
-          .join('\n');
-
-        await tgSend(
-          chatId,
-          `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nTicket rows: ${weeztixTicketStats.length}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}\n\nSample:\n${sample || '(vuoto)'}`
-        );
+        const parts = WEEZTIX_EVENTS.map(ev => {
+          const raw = weeztixLastRaw[ev.key];
+          const preview = raw ? JSON.stringify(raw, null, 2).slice(0, 1500) : '(vuoto)';
+          return `━━ ${ev.label} ━━\n${preview}`;
+        });
+        await tgSend(chatId, `🧾 WEEZTIX RAW (trimmed)\n\n${parts.join('\n\n') || '(vuoto)'}`);
         return;
       }
 
-      if (text.startsWith('/debugweeztix_raw')) {
+      if (text.startsWith('/debugweeztix')) {
         await ensureStatsFresh();
-        const preview = weeztixLastRaw ? JSON.stringify(weeztixLastRaw, null, 2).slice(0, 3500) : '(vuoto)';
-        await tgSend(chatId, `🧾 WEEZTIX RAW (trimmed)\n\n${preview}`);
+        const parts = WEEZTIX_EVENTS.map(ev => {
+          const stats = weeztixEventStats[ev.key] || [];
+          const sample = stats.slice(0, 6)
+            .map(t => `  • ${ticketLabel(t.id)} (${t.id.slice(0, 8)}…) | sold=${t.sold} | scanned=${t.scanned}`)
+            .join('\n');
+          return `━━ ${ev.label} (${stats.length} rows) ━━\n${sample || '  (vuoto)'}`;
+        });
+
+        await tgSend(
+          chatId,
+          `🛠 DEBUG WEEZTIX\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\nTicket rows totali: ${weeztixTicketStats.length}\nSubs alerts: ${alertSubscribers.size}\nMP_CAPACITY: ${MP_CAPACITY || '—'}\n\n${parts.join('\n\n')}`
+        );
         return;
       }
 
@@ -1038,39 +1082,61 @@ app.post('/webhook', (req, res) => {
           return;
         }
 
-        const { grouped: soldByLabel, total: soldTotal } = groupSoldByLabel();
         const { grouped: capByLabel } = groupCapacityByLabel();
-
-        const labels = Object.keys(soldByLabel).sort((a, b) => a.localeCompare(b, 'it'));
-        const lines = labels.map(label => {
-          const sold = soldByLabel[label] || 0;
-          const cap = capByLabel[label];
-          if (typeof cap === 'number' && cap > 0) {
-            const remaining = Math.max(0, cap - sold);
-            return `• ${label}: sold=${sold} | remaining=${remaining}/${cap}`;
-          }
-          return `• ${label}: sold=${sold} | remaining=n/d`;
-        }).join('\n');
-
-        let revenue = 0;
-        for (const [label, count] of Object.entries(soldByLabel)) {
-          const p = PRICE_MAP[label];
-          if (typeof p === 'number') revenue += p * Number(count || 0);
-        }
-
-        let soldPctLine = '';
-        if (MP_CAPACITY > 0) {
-          const pct = Math.round((soldTotal / MP_CAPACITY) * 100);
-          soldPctLine = `\n📊 Sold-out: ${pct}% (${soldTotal}/${MP_CAPACITY})`;
-        }
-
         const capNote = (Object.keys(weeztixCapByTicketId || {}).length)
           ? ''
           : '\nℹ️ Capacità per wave non trovata. Usa /ticket_raw e /capacities_debug.';
 
+        const eventBlocks = [];
+        let grandTotalSold = 0;
+        let grandRevenue = 0;
+
+        for (const ev of WEEZTIX_EVENTS) {
+          const stats = weeztixEventStats[ev.key] || [];
+          if (!stats.length) {
+            eventBlocks.push(`— ${ev.label}: nessun dato —`);
+            continue;
+          }
+
+          const soldByLabel = {};
+          let evTotal = 0;
+          for (const t of stats) {
+            const label = ticketLabel(t.id);
+            const v = Number(t.sold || 0);
+            soldByLabel[label] = (soldByLabel[label] || 0) + v;
+            evTotal += v;
+          }
+
+          const lines = Object.keys(soldByLabel).sort((a, b) => a.localeCompare(b, 'it')).map(label => {
+            const sold = soldByLabel[label] || 0;
+            const cap = capByLabel[label];
+            if (typeof cap === 'number' && cap > 0) {
+              const remaining = Math.max(0, cap - sold);
+              return `  • ${label}: sold=${sold} | remaining=${remaining}/${cap}`;
+            }
+            return `  • ${label}: sold=${sold}`;
+          }).join('\n');
+
+          let evRevenue = 0;
+          for (const [label, count] of Object.entries(soldByLabel)) {
+            const p = PRICE_MAP[label];
+            if (typeof p === 'number') evRevenue += p * Number(count || 0);
+          }
+
+          grandTotalSold += evTotal;
+          grandRevenue += evRevenue;
+          eventBlocks.push(`🎫 ${ev.label}\n${lines}\n  Totale: ${evTotal} | Revenue: €${evRevenue.toFixed(2)}`);
+        }
+
+        let soldPctLine = '';
+        if (MP_CAPACITY > 0) {
+          const pct = Math.round((grandTotalSold / MP_CAPACITY) * 100);
+          soldPctLine = `\n📊 Sold-out: ${pct}% (${grandTotalSold}/${MP_CAPACITY})`;
+        }
+
         await tgSend(
           chatId,
-          `🎟 BIGLIETTI\n\n${lines}\n\nTotale sold: ${soldTotal}${soldPctLine}\n💸 Revenue stimata: €${revenue.toFixed(2)}\nAggiornato: ${weeztixLastOkAt}${capNote}`
+          `🎟 BIGLIETTI\n\n${eventBlocks.join('\n\n')}\n\n────────────\nTotale sold: ${grandTotalSold}${soldPctLine}\n💸 Revenue totale: €${grandRevenue.toFixed(2)}\nAggiornato: ${weeztixLastOkAt}${capNote}`
         );
         return;
       }
@@ -1159,7 +1225,7 @@ app.post('/webhook', (req, res) => {
           : `⚡ Ritmo ingressi (ult 15m): ${delta15} (+${perHour}/h)`;
 
         const proxyNote = useProxy
-          ? '\nℹ️ Nota: non vedo “scanned” da Weeztix → uso i venduti come proxy (non ideale per la porta).'
+          ? '\nℹ️ Nota: non vedo "scanned" da Weeztix → uso i venduti come proxy (non ideale per la porta).'
           : '';
 
         await tgSend(
