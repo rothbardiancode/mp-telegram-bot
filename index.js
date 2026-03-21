@@ -1131,7 +1131,12 @@ app.post('/webhook', (req, res) => {
         const { grouped: capByLabel } = groupCapacityByLabel();
  
         if (!weeztixTicketStats.length && !Object.keys(capByLabel).length) {
-          await tgSend(chatId, `🎟️ Nessun dato ancora.\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
+               await tgSend(chatId,
+            `🎟️ Nessun dato ancora.\n\n` +
+            `Stats — Ultimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\n\n` +
+            `Capacità — Ultimo OK: ${weeztixCapLastOkAt || 'mai'}\nErrore: ${weeztixCapLastError || '—'}\n\n` +
+            `Prova /debugevents per vedere gli eventi disponibili, poi aggiorna WEEZTIX_EVENT_GUID_BRUNCH / WEEZTIX_EVENT_GUID_NIGHT e fai /refresh_caps.`
+          );
           return;
         }
 
