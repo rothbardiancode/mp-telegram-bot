@@ -142,30 +142,16 @@ async function redisSet(key, value) {
   }
 }
 
-// -------------------- Ticket mapping (YOUR GUIDS) --------------------
-const TICKET_MAP = {
-  "2b029302-aed9-4073-8ac5-a64859d45c42": "Wave 3",
-  "c6b59c00-2dc2-4643-84a3-6bbe9e0c7eaf": "Wave 2",
-  "74c31760-f904-4f9a-8a1c-9233d63f8f17": "Early bird",
-  "b2b6cb45-2cd4-48f7-98b4-e0b7a4b7dff7": "Omaggio",
-  "6eca0e42-564a-4f0b-91e5-bc8fccf76c6d": "Early bird (2)",
-  "0874b0ce-13dd-41c3-93c6-df4cbf539542": "Wave 4",
-  "f518a95a-bc8c-4018-8eae-27ab1a4329b4": "Wave 5"
-};
+const TICKET_MAP = {};
+const PRICE_MAP = {};
 
-const PRICE_MAP = {
-  "Early bird": 9.81,
-  "Early bird (2)": 9.81,
-  "Omaggio": 0,
-  "Wave 2": 11.79,
-  "Wave 3": 14.68,
-  "Wave 4": 14.68,
-  "Wave 5": 9.81
-};
+let weeztixTicketNameById = {};
+let weeztixTicketPriceById = {};
 
 function ticketLabel(id) {
-  return TICKET_MAP[id] || id;
+  return weeztixTicketNameById[id] || TICKET_MAP[id] || id;
 }
+
 
 // -------------------- OAuth connect/callback --------------------
 let OAUTH_STATE = null;
@@ -709,6 +695,19 @@ async function fetchCapacitiesFromApi() {
 
   const soldById = {};
   for (const t of weeztixTicketStats) soldById[t.id] = Number(t.sold || 0);
+  const nameById = {};
+const priceById = {};
+
+for (const t of arr) {
+  const id = extractTicketId(t);
+  if (!id) continue;
+
+  if (t.name) nameById[String(id)] = t.name;
+  if (typeof t.min_price === 'number') priceById[String(id)] = t.min_price / 100;
+
+  // ... existing capacity code unchanged
+}
+
 
   const qs = qsForDashboard(WEEZTIX_EVENTS[0]?.embeddedQs || '');
   const join = qs ? '&' : '?';
