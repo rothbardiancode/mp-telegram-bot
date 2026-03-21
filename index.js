@@ -326,7 +326,8 @@ const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
 const WEEZTIX_EVENT_GUID_NIGHT_RAW = (process.env.WEEZTIX_EVENT_GUID_NIGHT || '').trim();
 const WEEZTIX_EVENT_GUID_NIGHT = WEEZTIX_EVENT_GUID_NIGHT_RAW.split('?')[0];
 
-const WEEZTIX_AS = (process.env.WEEZTIX_AS || '').trim();
+// Strip accidental leading '?as=' if user set the full query string instead of just the GUID value
+const WEEZTIX_AS = (process.env.WEEZTIX_AS || '').trim().replace(/^\?as=/i, '').replace(/^as=/i, '');
 const AS_QS = WEEZTIX_AS ? `?as=${encodeURIComponent(WEEZTIX_AS)}` : '';
 
 function qsForDashboard() {
@@ -597,6 +598,13 @@ function extractTicketArray(obj) {
   for (const [k, v] of Object.entries(obj)) {
     if (Array.isArray(v) && k.toLowerCase().includes('ticket')) return v;
   }
+
+  // Handle numeric-keyed object: {0: {...}, 1: {...}}
+  const keys = Object.keys(obj);
+  if (keys.length && keys.every(k => /^\d+$/.test(k))) {
+    return keys.map(k => obj[k]);
+  }
+
   return null;
 }
 
