@@ -1142,6 +1142,7 @@ app.post('/webhook', (req, res) => {
       }
 
       if (text.startsWith('/biglietti')) {
+        try {
         await ensureStatsFresh();
         await ensureCapacitiesFresh();
 
@@ -1208,6 +1209,9 @@ app.post('/webhook', (req, res) => {
           chatId,
           `🎟 BIGLIETTI\n\n${lines}\n\nTotale sold: ${soldTotal}${soldPctLine}\n💸 Revenue stimata: €${revenue.toFixed(2)}\nAggiornato: ${weeztixLastOkAt || weeztixCapLastOkAt}${capNote}`
         );
+        } catch (e) {
+          await tgSend(chatId, `❌ /biglietti errore: ${e?.message || String(e)}`);
+        }
         return;
       }
 
