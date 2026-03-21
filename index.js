@@ -1059,6 +1059,28 @@ app.post('/webhook', (req, res) => {
         return;
       }
 
+      if (text.startsWith('/debugevents')) {
+        try {
+          const qs = qsForDashboard();
+          const r = await weeztixGet(`/event${qs}`, { timeout: 25000, companyScoped: true });
+          const arr = Array.isArray(r.data) ? r.data
+            : Array.isArray(r.data?.results) ? r.data.results
+            : Array.isArray(r.data?.data) ? r.data.data
+            : null;
+          if (arr && arr.length) {
+            const lines = arr.map(e => `• ${e.name || e.title || '?'} | ${e.guid || e.id || '?'}`).join('\n');
+            await tgSend(chatId, `📋 EVENTI (${arr.length})\n\n${lines}`);
+          } else {
+            const preview = JSON.stringify(r.data, null, 2).slice(0, 3000);
+            await tgSend(chatId, `📋 EVENTI RAW\n\n${preview}`);
+          }
+        } catch (e) {
+          const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 1200) : (e?.message || String(e));
+          await tgSend(chatId, `❌ /debugevents failed: ${detail}`);
+        }
+        return;
+      }
+
       if (text.startsWith('/capacities_debug')) {
         await handleCapacitiesDebug(chatId);
         return;
