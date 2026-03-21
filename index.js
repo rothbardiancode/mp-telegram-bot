@@ -743,6 +743,7 @@ async function fetchCapacitiesFromApi() {
 
         if (!arr || !arr.length) continue;
 
+        const isNight = guid === WEEZTIX_EVENT_GUID_NIGHT;
         for (const t of arr) {
           const id = extractTicketId(t);
           if (!id) continue;
