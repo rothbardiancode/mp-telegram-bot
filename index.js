@@ -318,7 +318,7 @@ async function ensureAccessToken() {
 }
 
 // -------------------- Robust parsing of WEEZTIX_EVENT_GUID + ?as=... --------------------
-const WEEZTIX_EVENT_GUID_RAW = (process.env.WEEZTIX_EVENT_GUID || '').trim();
+const WEEZTIX_EVENT_GUID_RAW = (process.env.WEEZTIX_EVENT_GUID_BRUNCH || process.env.WEEZTIX_EVENT_GUID || '').trim();
 const [WEEZTIX_EVENT_GUID_CLEAN, EMBEDDED_QS_PART] = WEEZTIX_EVENT_GUID_RAW.split('?');
 const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
 
