@@ -144,22 +144,32 @@ async function redisSet(key, value) {
 
 // -------------------- Ticket mapping (fallback — /event/{guid}/ticket 404s for this tenant) --------------------
 const TICKET_MAP = {
+  // Brunch
   "2b029302-aed9-4073-8ac5-a64859d45c42": "Wave 3",
   "c6b59c00-2dc2-4643-84a3-6bbe9e0c7eaf": "Wave 2",
   "74c31760-f904-4f9a-8a1c-9233d63f8f17": "Early bird",
   "b2b6cb45-2cd4-48f7-98b4-e0b7a4b7dff7": "Omaggio",
   "6eca0e42-564a-4f0b-91e5-bc8fccf76c6d": "Early bird (2)",
   "0874b0ce-13dd-41c3-93c6-df4cbf539542": "Wave 4",
-  "f518a95a-bc8c-4018-8eae-27ab1a4329b4": "Wave 5"
+  "f518a95a-bc8c-4018-8eae-27ab1a4329b4": "Wave 5",
+  // Night
+  "04917b6f-5669-4d98-a85d-1c7f8be24e0b": "Wave 3 (Night)",
+  "2e7f5a74-b80f-49ce-bb8a-571fdde430c1": "Wave 1 (Night)",
+  "8ca0ea97-c33d-4803-a628-bbc962e13538": "Wave 2 (Night)",
+  "b69a81d2-5347-40bb-b5bd-2e7c8f647cad": "Omaggio (Night)"
 };
 const PRICE_MAP = {
-  "Early bird":     9.81,
-  "Early bird (2)": 9.81,
-  "Omaggio":        0,
-  "Wave 2":         11.79,
-  "Wave 3":         14.68,
-  "Wave 4":         14.68,
-  "Wave 5":         9.81
+  "Early bird":       9.81,
+  "Early bird (2)":   9.81,
+  "Omaggio":          0,
+  "Wave 2":           11.79,
+  "Wave 3":           14.68,
+  "Wave 4":           14.68,
+  "Wave 5":           9.81,
+  "Wave 1 (Night)":   13.82,
+  "Wave 2 (Night)":   16.74,
+  "Wave 3 (Night)":   9.81,
+  "Omaggio (Night)":  0
 };
 
 // Auto-discovered from /event/{guid}/ticket response
@@ -466,6 +476,28 @@ function parseWeeztixStats(data) {
   return out;
 }
 
+async function fetchStatsForGuid(guid) {
+  const statsUrl = `https://api.weeztix.com/statistics/dashboard/${guid}${qsForDashboard()}`;
+  const callApi = async () => {
+    await ensureAccessToken();
+    return axios.get(statsUrl, {
+      headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
+      timeout: 30000
+    });
+  };
+  try {
+    return await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+  } catch (e) {
+    const status = e?.response?.status;
+    const msg = e?.response?.data?.error_description || '';
+    if (status === 401 || (status === 400 && msg.includes('JWT'))) {
+      await refreshAccessToken();
+      return withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+    }
+    throw e;
+  }
+}
+
 async function fetchWeeztixStats() {
   try {
     if (!WEEZTIX_EVENT_GUID) {
@@ -473,38 +505,23 @@ async function fetchWeeztixStats() {
       return;
     }
 
-    const statsUrl = `https://api.weeztix.com/statistics/dashboard/${WEEZTIX_EVENT_GUID}${qsForDashboard()}`;
+    const guidsToFetch = [WEEZTIX_EVENT_GUID, ...(WEEZTIX_EVENT_GUID_NIGHT ? [WEEZTIX_EVENT_GUID_NIGHT] : [])];
+    const allParsed = [];
 
-    const callApi = async () => {
-      await ensureAccessToken();
-      return axios.get(statsUrl, {
-        headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
-        timeout: 30000
-      });
-    };
-
-    let resp;
-    try {
-      resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
-    } catch (e) {
-      const status = e?.response?.status;
-      const msg = e?.response?.data?.error_description || '';
-      if (status === 401 || (status === 400 && msg.includes('JWT'))) {
-        await refreshAccessToken();
-        resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
-      } else {
-        throw e;
+    for (const guid of guidsToFetch) {
+      try {
+        const resp = await fetchStatsForGuid(guid);
+        if (guid === WEEZTIX_EVENT_GUID) weeztixLastRaw = resp.data ?? { _empty: true };
+        const parsed = parseWeeztixStats(resp.data);
+        allParsed.push(...parsed);
+      } catch (e) {
+        console.error(`fetchWeeztixStats: failed for guid ${guid}:`, e?.message || e);
       }
     }
 
-    weeztixLastRaw = resp.data ?? { _empty: true };
-    const parsed = parseWeeztixStats(resp.data);
+    const parsed = allParsed;
     if (!parsed.length) {
-      const topKeys = resp.data && typeof resp.data === 'object' ? Object.keys(resp.data).slice(0, 6).join(', ') : '?';
-      const hasAggs = resp.data?.aggregations || Object.values(resp.data || {}).some(v => v?.aggregations);
-      weeztixLastError = hasAggs
-        ? `Stats fetched but all buckets empty (hits.total=0). Possible wrong event GUID or no sales yet. Top keys: ${topKeys}`
-        : `Stats fetched but unrecognised structure. Top keys: ${topKeys}`;
+      weeztixLastError = 'Stats fetched but no data from any event GUID';
       return;
     }
 
@@ -736,11 +753,12 @@ async function fetchCapacitiesFromApi() {
 
         if (!arr || !arr.length) continue;
 
+        const isNight = guid === WEEZTIX_EVENT_GUID_NIGHT;
         for (const t of arr) {
           const id = extractTicketId(t);
           if (!id) continue;
 
-          if (t.name) combinedNameById[String(id)] = t.name;
+          if (t.name) combinedNameById[String(id)] = isNight ? `${t.name} (Night)` : t.name;
           if (typeof t.min_price === 'number') combinedPriceById[String(id)] = t.min_price / 100;
 
           const { cap, meta } = extractCapacityDeep(t, soldById);
