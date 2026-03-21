@@ -1118,15 +1118,16 @@ app.post('/webhook', (req, res) => {
         await ensureStatsFresh();
         await ensureCapacitiesFresh();
 
-        if (!weeztixTicketStats.length) {
+        const { grouped: soldByLabel, total: soldTotal } = groupSoldByLabel();
+        const { grouped: capByLabel } = groupCapacityByLabel();
+
+        if (!weeztixTicketStats.length && !Object.keys(capByLabel).length) {
           await tgSend(chatId, `🎟️ Nessun dato ancora.\n\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
           return;
         }
 
-        const { grouped: soldByLabel, total: soldTotal } = groupSoldByLabel();
-        const { grouped: capByLabel } = groupCapacityByLabel();
-
-        const labels = Object.keys(soldByLabel).sort((a, b) => a.localeCompare(b, 'it'));
+        const allLabelSet = new Set([...Object.keys(soldByLabel), ...Object.keys(capByLabel)]);
+        const labels = [...allLabelSet].sort((a, b) => a.localeCompare(b, 'it'));
         const lines = labels.map(label => {
           const sold = soldByLabel[label] || 0;
           const cap = capByLabel[label];
