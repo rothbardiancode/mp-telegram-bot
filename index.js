@@ -781,13 +781,17 @@ async function ensureCapacitiesFresh() {
     try {
       const obj = JSON.parse(cached);
       if (obj?.map && typeof obj.map === 'object') {
-        weeztixCapByTicketId = obj.map;
-        weeztixCapMetaByTicketId = obj.metaMap || {};
-        if (obj.nameById) Object.assign(weeztixTicketNameById, obj.nameById);
-        if (obj.priceById) Object.assign(weeztixTicketPriceById, obj.priceById);
-        weeztixCapLastOkAt = obj.ts || new Date().toISOString();
-        weeztixCapLastError = null;
-        return;
+          const redisAgeMs = obj.ts ? (Date.now() - Date.parse(obj.ts)) : Infinity;
+        if (redisAgeMs <= CAP_CACHE_MAX_AGE_MS) {
+          weeztixCapByTicketId = obj.map;
+          weeztixCapMetaByTicketId = obj.metaMap || {};
+          if (obj.nameById) Object.assign(weeztixTicketNameById, obj.nameById);
+          if (obj.priceById) Object.assign(weeztixTicketPriceById, obj.priceById);
+          weeztixCapLastOkAt = obj.ts || new Date().toISOString();
+          weeztixCapLastError = null;
+          return;
+        }
+        // Redis cache is stale — fall through to live API fetch;
       }
     } catch (_) {}
   }
@@ -1105,7 +1109,20 @@ app.post('/webhook', (req, res) => {
         await handlePasswordsCommand(chatId);
         return;
       }
-
+      if (text.startsWith('/refresh_caps')) {
+        await tgSend(chatId, '🔄 Svuoto cache capacità e ri-fetcho da API...');
+        await redisSet('weeztix_ticket_capacities', '{}');
+        weeztixCapByTicketId = {};
+        weeztixCapMetaByTicketId = {};
+        weeztixCapLastOkAt = null;
+        await fetchCapacitiesFromApi();
+        const count = Object.keys(weeztixCapByTicketId).length;
+        await tgSend(chatId, count
+          ? `✅ Capacità aggiornate: ${count} ticket trovati.\nUltimo OK: ${weeztixCapLastOkAt}`
+          : `❌ Nessuna capacità trovata.\nErrore: ${weeztixCapLastError || '—'}`);
+        return;
+      }
+ 
       if (text.startsWith('/biglietti')) {
         await ensureStatsFresh();
         await ensureCapacitiesFresh();
