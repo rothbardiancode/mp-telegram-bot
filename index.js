@@ -385,6 +385,22 @@ const SERIES_KEEP_MS = 48 * 60 * 60 * 1000;
 
 function parseWeeztixStats(data) {
   const out = [];
+   
+  // Multi-event envelope: top-level keys are event names, each value has .aggregations
+  if (data && !data.aggregations && typeof data === 'object' && !Array.isArray(data)) {
+    const eventEntries = Object.values(data).filter(v => v && v.aggregations);
+    if (eventEntries.length) {
+      for (const eventData of eventEntries) {
+        for (const item of parseWeeztixStats(eventData)) {
+          const existing = out.find(x => x.id === item.id);
+          if (existing) { existing.sold += item.sold; existing.scanned += item.scanned; }
+          else out.push({ ...item });
+        }
+      }
+      return out;
+    }
+  }
+ 
   const aggs = data && data.aggregations ? data.aggregations : null;
   if (!aggs) return out;
 
@@ -463,7 +479,11 @@ async function fetchWeeztixStats() {
     weeztixLastRaw = resp.data ?? { _empty: true };
     const parsed = parseWeeztixStats(resp.data);
     if (!parsed.length) {
-      weeztixLastError = 'Stats fetched but parsing returned empty';
+       const topKeys = resp.data && typeof resp.data === 'object' ? Object.keys(resp.data).slice(0, 6).join(', ') : '?';
+      const hasAggs = resp.data?.aggregations || Object.values(resp.data || {}).some(v => v?.aggregations);
+      weeztixLastError = hasAggs
+        ? `Stats fetched but all buckets empty (hits.total=0). Possible wrong event GUID or no sales yet. Top keys: ${topKeys}`
+        : `Stats fetched but unrecognised structure. Top keys: ${topKeys}`;
       return;
     }
 
