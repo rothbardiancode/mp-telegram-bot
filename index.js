@@ -1189,5 +1189,18 @@ app.get('/', (req, res) => {
   res.send('MP Telegram Bot is running 🇮🇹');
 });
 
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  process.exit(1);
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Bot live on port', PORT));
+const server = app.listen(PORT, () => console.log('Bot live on port', PORT));
+server.on('error', (err) => {
+  console.error('Server listen error:', err);
+  process.exit(1);
+});
