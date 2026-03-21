@@ -142,29 +142,16 @@ async function redisSet(key, value) {
   }
 }
 
-// -------------------- Ticket mapping (YOUR GUIDS) --------------------
-const TICKET_MAP = {
-  "2b029302-aed9-4073-8ac5-a64859d45c42": "Wave 3",
-  "c6b59c00-2dc2-4643-84a3-6bbe9e0c7eaf": "Wave 2",
-  "74c31760-f904-4f9a-8a1c-9233d63f8f17": "Early bird",
-  "b2b6cb45-2cd4-48f7-98b4-e0b7a4b7dff7": "Omaggio",
-  "6eca0e42-564a-4f0b-91e5-bc8fccf76c6d": "Early bird (2)",
-  "0874b0ce-13dd-41c3-93c6-df4cbf539542": "Wave 4",
-  "f518a95a-bc8c-4018-8eae-27ab1a4329b4": "Wave 5"
-};
+// -------------------- Ticket mapping (fallback only — names/prices auto-discovered from API) --------------------
+const TICKET_MAP = {};
+const PRICE_MAP = {};
 
-const PRICE_MAP = {
-  "Early bird": 9.81,
-  "Early bird (2)": 9.81,
-  "Omaggio": 0,
-  "Wave 2": 11.79,
-  "Wave 3": 14.68,
-  "Wave 4": 14.68,
-  "Wave 5": 9.81
-};
+// Auto-discovered from /event/{guid}/ticket response
+let weeztixTicketNameById = {};  // {guid: name}
+let weeztixTicketPriceById = {}; // {guid: price_eur}
 
 function ticketLabel(id) {
-  return TICKET_MAP[id] || id;
+  return weeztixTicketNameById[id] || TICKET_MAP[id] || id;
 }
 
 // -------------------- OAuth connect/callback --------------------
@@ -707,9 +694,15 @@ async function fetchCapacitiesFromApi() {
       const map = {};
       const metaMap = {};
 
+      const nameById = {};
+      const priceById = {};
+
       for (const t of arr) {
         const id = extractTicketId(t);
         if (!id) continue;
+
+        if (t.name) nameById[String(id)] = t.name;
+        if (typeof t.min_price === 'number') priceById[String(id)] = t.min_price / 100;
 
         const { cap, meta } = extractCapacityDeep(t, soldById);
         if (cap != null) {
@@ -721,10 +714,12 @@ async function fetchCapacitiesFromApi() {
       if (Object.keys(map).length) {
         weeztixCapByTicketId = map;
         weeztixCapMetaByTicketId = metaMap;
+        Object.assign(weeztixTicketNameById, nameById);
+        Object.assign(weeztixTicketPriceById, priceById);
         weeztixCapLastOkAt = new Date().toISOString();
         weeztixCapLastError = null;
 
-        await redisSet('weeztix_ticket_capacities', JSON.stringify({ ts: weeztixCapLastOkAt, map, metaMap }));
+        await redisSet('weeztix_ticket_capacities', JSON.stringify({ ts: weeztixCapLastOkAt, map, metaMap, nameById, priceById }));
         return;
       }
     } catch (e) {
@@ -745,6 +740,8 @@ async function ensureCapacitiesFresh() {
       if (obj?.map && typeof obj.map === 'object') {
         weeztixCapByTicketId = obj.map;
         weeztixCapMetaByTicketId = obj.metaMap || {};
+        if (obj.nameById) Object.assign(weeztixTicketNameById, obj.nameById);
+        if (obj.priceById) Object.assign(weeztixTicketPriceById, obj.priceById);
         weeztixCapLastOkAt = obj.ts || new Date().toISOString();
         weeztixCapLastError = null;
         return;
@@ -910,9 +907,17 @@ async function handleTicketRaw(chatId) {
   try {
     const r = await weeztixGet(`/event/${WEEZTIX_EVENT_GUID}/ticket${qsForDashboard()}`, { timeout: 25000, companyScoped: true });
     const arr = extractTicketArray(r.data) || [];
-    const first = arr[0] || r.data;
-    const preview = JSON.stringify(first, null, 2).slice(0, 3500);
-    await tgSend(chatId, `🧾 TICKET RAW (first item, trimmed)\n\n${preview}`);
+    if (arr.length) {
+      const lines = arr.map(t => {
+        const id = extractTicketId(t);
+        const price = typeof t.min_price === 'number' ? `€${(t.min_price / 100).toFixed(2)}` : 'n/d';
+        return `• ${t.name || '?'} | ${id || '?'} | stock=${t.available_stock ?? 'n/d'} | price=${price}`;
+      }).join('\n');
+      await tgSend(chatId, `🧾 TICKET LIST (${arr.length} types)\n\n${lines}`);
+    } else {
+      const preview = JSON.stringify(r.data, null, 2).slice(0, 3500);
+      await tgSend(chatId, `🧾 TICKET RAW (no array found)\n\n${preview}`);
+    }
   } catch (e) {
     const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 1200) : (e?.message || String(e));
     await tgSend(chatId, `❌ /ticket_raw failed: ${detail}`);
@@ -1053,9 +1058,9 @@ app.post('/webhook', (req, res) => {
         }).join('\n');
 
         let revenue = 0;
-        for (const [label, count] of Object.entries(soldByLabel)) {
-          const p = PRICE_MAP[label];
-          if (typeof p === 'number') revenue += p * Number(count || 0);
+        for (const t of weeztixTicketStats) {
+          const price = weeztixTicketPriceById[t.id] ?? PRICE_MAP[ticketLabel(t.id)];
+          if (typeof price === 'number') revenue += price * Number(t.sold || 0);
         }
 
         let soldPctLine = '';
