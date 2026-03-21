@@ -150,7 +150,7 @@ const TICKET_MAP = {
 // Night
   "04917b6f-5669-4d98-a85d-1c7f8be24e0b": "Wave 3 (Night)",
   "2e7f5a74-b80f-49ce-bb8a-571fdde430c1": "Wave 1 (Night)",
-  "8ca0ea97-c33d-4803-a628-bbc962e13538": "Wave 2"
+  "8ca0ea97-c33d-4803-a628-bbc962e13538": "Wave 2",
   "b69a81d2-5347-40bb-b5bd-2e7c8f647cad": "Omaggio (Night)"
 };
 const PRICE_MAP = {
