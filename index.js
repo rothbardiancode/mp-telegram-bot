@@ -145,13 +145,8 @@ async function redisSet(key, value) {
 // -------------------- Ticket mapping (fallback — /event/{guid}/ticket 404s for this tenant) --------------------
 const TICKET_MAP = {
   // Brunch
-  "2b029302-aed9-4073-8ac5-a64859d45c42": "Wave 3",
-  "c6b59c00-2dc2-4643-84a3-6bbe9e0c7eaf": "Wave 2",
-  "74c31760-f904-4f9a-8a1c-9233d63f8f17": "Early bird",
-  "b2b6cb45-2cd4-48f7-98b4-e0b7a4b7dff7": "Omaggio",
-  "6eca0e42-564a-4f0b-91e5-bc8fccf76c6d": "Early bird (2)",
-  "0874b0ce-13dd-41c3-93c6-df4cbf539542": "Wave 4",
-  "f518a95a-bc8c-4018-8eae-27ab1a4329b4": "Wave 5",
+  "4b52e1cd-570c-4f5b-8a5a-62c79951aadd": "Brunch + Serata",
+  "a0ecbc6e-c420-4281-84e0-5f210ee1bb2f": "Brunch + Serata (close friends)",
   // Night
   "04917b6f-5669-4d98-a85d-1c7f8be24e0b": "Wave 3 (Night)",
   "2e7f5a74-b80f-49ce-bb8a-571fdde430c1": "Wave 1 (Night)",
@@ -159,17 +154,12 @@ const TICKET_MAP = {
   "b69a81d2-5347-40bb-b5bd-2e7c8f647cad": "Omaggio (Night)"
 };
 const PRICE_MAP = {
-  "Early bird":       9.81,
-  "Early bird (2)":   9.81,
-  "Omaggio":          0,
-  "Wave 2":           11.79,
-  "Wave 3":           14.68,
-  "Wave 4":           14.68,
-  "Wave 5":           9.81,
-  "Wave 1 (Night)":   13.82,
-  "Wave 2 (Night)":   16.74,
-  "Wave 3 (Night)":   9.81,
-  "Omaggio (Night)":  0
+  "Brunch + Serata":                  31.33,
+  "Brunch + Serata (close friends)":  21.90,
+  "Wave 1 (Night)":                   13.82,
+  "Wave 2 (Night)":                   16.74,
+  "Wave 3 (Night)":                   9.81,
+  "Omaggio (Night)":                  0
 };
 
 // Auto-discovered from /event/{guid}/ticket response
