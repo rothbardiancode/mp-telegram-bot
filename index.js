@@ -147,6 +147,7 @@ const TICKET_MAP = {
   // Brunch
   "4b52e1cd-570c-4f5b-8a5a-62c79951aadd": "Brunch + Serata",
   "a0ecbc6e-c420-4281-84e0-5f210ee1bb2f": "Brunch + Serata (close friends)",
+  "cfe3ab26-c9d8-4646-881d-06fbc18aa864": "Full day (Extra 10)",
   // Night
   "04917b6f-5669-4d98-a85d-1c7f8be24e0b": "Wave 3 (Night)",
   "2e7f5a74-b80f-49ce-bb8a-571fdde430c1": "Wave 1 (Night)",
@@ -156,6 +157,7 @@ const TICKET_MAP = {
 const PRICE_MAP = {
   "Brunch + Serata":                  31.33,
   "Brunch + Serata (close friends)":  21.90,
+  "Full day (Extra 10)":              10.00,
   "Wave 1 (Night)":                   13.82,
   "Wave 2 (Night)":                   16.74,
   "Wave 3 (Night)":                   9.81,
