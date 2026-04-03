@@ -486,18 +486,18 @@ async function fetchStatsForGuid(guid) {
 
 async function fetchWeeztixStats() {
   try {
-    if (!WEEZTIX_EVENT_GUID) {
-      weeztixLastError = 'Missing WEEZTIX_EVENT_GUID';
+    if (!WEEZTIX_EVENT_GUID_NIGHT) {
+      weeztixLastError = 'Missing WEEZTIX_EVENT_GUID_NIGHT';
       return;
     }
 
-    const guidsToFetch = [WEEZTIX_EVENT_GUID, ...(WEEZTIX_EVENT_GUID_NIGHT ? [WEEZTIX_EVENT_GUID_NIGHT] : [])];
+    const guidsToFetch = [WEEZTIX_EVENT_GUID_NIGHT];
     const allParsed = [];
 
     for (const guid of guidsToFetch) {
       try {
         const resp = await fetchStatsForGuid(guid);
-        if (guid === WEEZTIX_EVENT_GUID) weeztixLastRaw = resp.data ?? { _empty: true };
+        if (guid === WEEZTIX_EVENT_GUID_NIGHT) weeztixLastRaw = resp.data ?? { _empty: true };
         const parsed = parseWeeztixStats(resp.data);
         allParsed.push(...parsed);
       } catch (e) {
@@ -965,7 +965,6 @@ async function handlePasswordsCommand(chatId) {
 async function handleTicketRaw(chatId) {
   const qs = qsForDashboard();
   const events = [
-    { label: 'BRUNCH', guid: WEEZTIX_EVENT_GUID },
     ...(WEEZTIX_EVENT_GUID_NIGHT ? [{ label: 'NIGHT', guid: WEEZTIX_EVENT_GUID_NIGHT }] : [])
   ];
   for (const { label, guid } of events) {
@@ -1149,7 +1148,7 @@ app.post('/webhook', (req, res) => {
             `🎟️ Nessun dato ancora.\n\n` +
             `Stats — Ultimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\n\n` +
             `Capacità — Ultimo OK: ${weeztixCapLastOkAt || 'mai'}\nErrore: ${weeztixCapLastError || '—'}\n\n` +
-            `Prova /debugevents per vedere gli eventi disponibili, poi aggiorna WEEZTIX_EVENT_GUID_BRUNCH / WEEZTIX_EVENT_GUID_NIGHT e fai /refresh_caps.`
+            `Prova /debugevents per vedere gli eventi disponibili, poi aggiorna WEEZTIX_EVENT_GUID_NIGHT e fai /refresh_caps.`
           );
           return;
         }
