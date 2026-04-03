@@ -703,8 +703,8 @@ async function fetchCapacitiesFromApi() {
   weeztixCapLastError = null;
   weeztixCapMetaByTicketId = {};
 
-  if (!WEEZTIX_EVENT_GUID) {
-    weeztixCapLastError = 'Missing WEEZTIX_EVENT_GUID';
+  if (!WEEZTIX_EVENT_GUID_NIGHT) {
+    weeztixCapLastError = 'Missing WEEZTIX_EVENT_GUID_NIGHT';
     return;
   }
 
@@ -714,7 +714,7 @@ async function fetchCapacitiesFromApi() {
   const qs = qsForDashboard();
   const join = qs ? '&' : '?';
 
-  const eventGuids = [WEEZTIX_EVENT_GUID, ...(WEEZTIX_EVENT_GUID_NIGHT ? [WEEZTIX_EVENT_GUID_NIGHT] : [])];
+  const eventGuids = [WEEZTIX_EVENT_GUID_NIGHT];
 
   const combinedMap = {};
   const combinedMetaMap = {};
