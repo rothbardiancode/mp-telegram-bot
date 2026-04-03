@@ -7,7 +7,7 @@
  * OAUTH_CLIENT_ID
  * OAUTH_CLIENT_SECRET
  * OAUTH_CLIENT_REDIRECT
- * WEEZTIX_EVENT_GUID          (can be pure GUID OR "GUID?as=....")
+ * WEEZTIX_EVENT_GUID_NIGHT     (GUID for the Night event)
  * MP_CAPACITY
  *
  * After connecting (seed only):
@@ -17,7 +17,7 @@
  * WEEZTIX_POLL_SECONDS (default 90)
  * ADMIN_CHAT_ID
  * WEEZTIX_API_BASE (default https://api.weeztix.com) - dashboard API base
- * WEEZTIX_AS (optional; if set, overrides any ?as=... embedded in WEEZTIX_EVENT_GUID)
+ * WEEZTIX_AS (optional; ?as= override for API calls)
  *
  * Redis (Upstash REST):
  * REDIS_URL
@@ -312,12 +312,7 @@ async function ensureAccessToken() {
   if (!WEEZTIX_ACCESS_TOKEN) await refreshAccessToken();
 }
 
-// -------------------- Robust parsing of WEEZTIX_EVENT_GUID + ?as=... --------------------
-const WEEZTIX_EVENT_GUID_RAW = (process.env.WEEZTIX_EVENT_GUID_BRUNCH || process.env.WEEZTIX_EVENT_GUID || '').trim();
-const [WEEZTIX_EVENT_GUID_CLEAN, EMBEDDED_QS_PART] = WEEZTIX_EVENT_GUID_RAW.split('?');
-const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
-
-// NIGHT event
+// -------------------- NIGHT event --------------------
 const WEEZTIX_EVENT_GUID_NIGHT_RAW = (process.env.WEEZTIX_EVENT_GUID_NIGHT || '').trim();
 const WEEZTIX_EVENT_GUID_NIGHT = WEEZTIX_EVENT_GUID_NIGHT_RAW.split('?')[0];
 
@@ -326,10 +321,8 @@ const WEEZTIX_AS = (process.env.WEEZTIX_AS || '').trim().replace(/^\?as=/i, '').
 const AS_QS = WEEZTIX_AS ? `?as=${encodeURIComponent(WEEZTIX_AS)}` : '';
 
 function qsForDashboard() {
-  return AS_QS || EMBEDDED_QS || '';
+  return AS_QS;
 }
-
-const WEEZTIX_EVENT_GUID = WEEZTIX_EVENT_GUID_CLEAN;
 
 // -------------------- API base --------------------
 const WEEZTIX_API_BASE = process.env.WEEZTIX_API_BASE || 'https://api.weeztix.com';
@@ -1004,7 +997,7 @@ async function handleCapacitiesDebug(chatId) {
 
   await tgSendLong(chatId,
     `🧪 CAPACITIES DEBUG\n` +
-    `Event GUID: ${WEEZTIX_EVENT_GUID}\n` +
+    `Event GUID: ${WEEZTIX_EVENT_GUID_NIGHT}\n` +
     `QS used: ${qsForDashboard() || '(none)'}\n` +
     `Ultimo OK cap: ${weeztixCapLastOkAt || 'mai'}\n` +
     `Errore cap: ${weeztixCapLastError || '—'}\n` +
@@ -1326,6 +1319,9 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
   process.exit(1);
 });
+
+// Clear cached capacity data on startup so stale brunch tickets are not loaded from Redis
+redisSet('weeztix_ticket_capacities', '{}').catch(e => console.warn('Could not clear capacity cache on startup:', e?.message));
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => console.log('Bot live on port', PORT));
