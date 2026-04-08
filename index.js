@@ -144,17 +144,17 @@ async function redisSet(key, value) {
 
 // -------------------- Ticket mapping (fallback — /event/{guid}/ticket 404s for this tenant) --------------------
 const TICKET_MAP = {
-  // Night
-  "04917b6f-5669-4d98-a85d-1c7f8be24e0b": "Wave 3 (Night)",
-  "2e7f5a74-b80f-49ce-bb8a-571fdde430c1": "Wave 1 (Night)",
-  "8ca0ea97-c33d-4803-a628-bbc962e13538": "Wave 2 (Night)",
-  "b69a81d2-5347-40bb-b5bd-2e7c8f647cad": "Omaggio (Night)"
+  "04917b6f-5669-4d98-a85d-1c7f8be24e0b": "Wave 3",
+  "2e7f5a74-b80f-49ce-bb8a-571fdde430c1": "Wave 1",
+  "8ca0ea97-c33d-4803-a628-bbc962e13538": "Wave 2",
+  "b69a81d2-5347-40bb-b5bd-2e7c8f647cad": "Omaggio"
 };
 const PRICE_MAP = {
-  "Wave 1 (Night)":                   13.82,
-  "Wave 2 (Night)":                   16.74,
-  "Wave 3 (Night)":                   9.81,
-  "Omaggio (Night)":                  0
+  "Wave 1":   13.82,
+  "Wave 2":   16.74,
+  "Wave 3":   9.81,
+  "Omaggio":  0
+>>>>>>> ad0f9ca (Remove brunch event; bot now shows Night-only tickets)
 };
 
 // Auto-discovered from /event/{guid}/ticket response
@@ -313,13 +313,11 @@ async function ensureAccessToken() {
 }
 
 // -------------------- Robust parsing of WEEZTIX_EVENT_GUID + ?as=... --------------------
-const WEEZTIX_EVENT_GUID_RAW = (process.env.WEEZTIX_EVENT_GUID_BRUNCH || process.env.WEEZTIX_EVENT_GUID || '').trim();
-const [WEEZTIX_EVENT_GUID_CLEAN, EMBEDDED_QS_PART] = WEEZTIX_EVENT_GUID_RAW.split('?');
-const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
-
-// NIGHT event
-const WEEZTIX_EVENT_GUID_NIGHT_RAW = (process.env.WEEZTIX_EVENT_GUID_NIGHT || '').trim();
+// Night-only event (brunch event deleted)
+const WEEZTIX_EVENT_GUID_NIGHT_RAW = (process.env.WEEZTIX_EVENT_GUID_NIGHT || process.env.WEEZTIX_EVENT_GUID || '').trim();
 const WEEZTIX_EVENT_GUID_NIGHT = WEEZTIX_EVENT_GUID_NIGHT_RAW.split('?')[0];
+const EMBEDDED_QS_PART = WEEZTIX_EVENT_GUID_NIGHT_RAW.split('?')[1];
+const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
 
 // Strip accidental leading '?as=' if user set the full query string instead of just the GUID value
 const WEEZTIX_AS = (process.env.WEEZTIX_AS || '').trim().replace(/^\?as=/i, '').replace(/^as=/i, '');
@@ -329,7 +327,7 @@ function qsForDashboard() {
   return AS_QS || EMBEDDED_QS || '';
 }
 
-const WEEZTIX_EVENT_GUID = WEEZTIX_EVENT_GUID_CLEAN;
+const WEEZTIX_EVENT_GUID = WEEZTIX_EVENT_GUID_NIGHT;
 
 // -------------------- API base --------------------
 const WEEZTIX_API_BASE = process.env.WEEZTIX_API_BASE || 'https://api.weeztix.com';
@@ -491,18 +489,15 @@ async function fetchWeeztixStats() {
       return;
     }
 
-    const guidsToFetch = [WEEZTIX_EVENT_GUID, ...(WEEZTIX_EVENT_GUID_NIGHT ? [WEEZTIX_EVENT_GUID_NIGHT] : [])];
     const allParsed = [];
 
-    for (const guid of guidsToFetch) {
-      try {
-        const resp = await fetchStatsForGuid(guid);
-        if (guid === WEEZTIX_EVENT_GUID) weeztixLastRaw = resp.data ?? { _empty: true };
-        const parsed = parseWeeztixStats(resp.data);
-        allParsed.push(...parsed);
-      } catch (e) {
-        console.error(`fetchWeeztixStats: failed for guid ${guid}:`, e?.message || e);
-      }
+    try {
+      const resp = await fetchStatsForGuid(WEEZTIX_EVENT_GUID);
+      weeztixLastRaw = resp.data ?? { _empty: true };
+      const parsed = parseWeeztixStats(resp.data);
+      allParsed.push(...parsed);
+    } catch (e) {
+      console.error(`fetchWeeztixStats: failed for guid ${WEEZTIX_EVENT_GUID}:`, e?.message || e);
     }
 
     const parsed = allParsed;
@@ -714,7 +709,7 @@ async function fetchCapacitiesFromApi() {
   const qs = qsForDashboard();
   const join = qs ? '&' : '?';
 
-  const eventGuids = [WEEZTIX_EVENT_GUID, ...(WEEZTIX_EVENT_GUID_NIGHT ? [WEEZTIX_EVENT_GUID_NIGHT] : [])];
+  const eventGuids = [WEEZTIX_EVENT_GUID];
 
   const combinedMap = {};
   const combinedMetaMap = {};
@@ -746,13 +741,12 @@ async function fetchCapacitiesFromApi() {
 
         if (!arr || !arr.length) continue;
 
-        const isNight = guid === WEEZTIX_EVENT_GUID_NIGHT;
         for (const t of arr) {
           const id = extractTicketId(t);
           if (!id) continue;
 
           const tName = t.name || t.title || t.label;
-          if (tName) combinedNameById[String(id)] = isNight ? `${tName} (Night)` : tName;
+          if (tName) combinedNameById[String(id)] = tName;
           if (typeof t.min_price === 'number') combinedPriceById[String(id)] = t.min_price / 100;
 
           const { cap, meta } = extractCapacityDeep(t, soldById);
@@ -965,8 +959,7 @@ async function handlePasswordsCommand(chatId) {
 async function handleTicketRaw(chatId) {
   const qs = qsForDashboard();
   const events = [
-    { label: 'BRUNCH', guid: WEEZTIX_EVENT_GUID },
-    ...(WEEZTIX_EVENT_GUID_NIGHT ? [{ label: 'NIGHT', guid: WEEZTIX_EVENT_GUID_NIGHT }] : [])
+    { label: 'NIGHT', guid: WEEZTIX_EVENT_GUID }
   ];
   for (const { label, guid } of events) {
     try {
