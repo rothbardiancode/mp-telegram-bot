@@ -154,7 +154,6 @@ const PRICE_MAP = {
   "Wave 2":   16.74,
   "Wave 3":   9.81,
   "Omaggio":  0
->>>>>>> ad0f9ca (Remove brunch event; bot now shows Night-only tickets)
 };
 
 // Auto-discovered from /event/{guid}/ticket response
