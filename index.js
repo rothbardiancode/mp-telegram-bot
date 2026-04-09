@@ -117,7 +117,7 @@ async function redisGet(key) {
     const url = `${REDIS_URL}/get/${encodeURIComponent(key)}`;
     const r = await axios.post(url, null, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
-      timeout: 10000
+      timeout: 3000
     });
     return typeof r.data?.result === 'string' ? r.data.result : null;
   } catch (e) {
@@ -135,7 +135,7 @@ async function redisSet(key, value) {
         Authorization: `Bearer ${REDIS_TOKEN}`,
         'Content-Type': 'text/plain'
       },
-      timeout: 10000
+      timeout: 3000
     });
   } catch (e) {
     console.error('Redis SET error:', e?.response?.data || e.message || e);
