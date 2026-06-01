@@ -86,11 +86,19 @@ const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || null;
 // Organizer opt-in alerts (DM)
 const alertSubscribers = new Set();
 
-// Sellout alerts (sold-based)
+// Overall event sell-out alerts (based on MP_CAPACITY)
 const selloutAlerts = { p80: false, p90: false, p95: false, p100: false };
 
 // Door alerts (scanned-based)
 const doorAlerts = { p70: false, p85: false, p95: false };
+
+// Per-ticket-wave alerts: ticketId -> {p80, p90, p100}
+const ticketWaveAlerts = new Map();
+
+function getTicketAlertState(id) {
+  if (!ticketWaveAlerts.has(id)) ticketWaveAlerts.set(id, { p80: false, p90: false, p100: false });
+  return ticketWaveAlerts.get(id);
+}
 
 async function broadcastAlert(message) {
   const ids = Array.from(alertSubscribers);
@@ -530,6 +538,32 @@ async function fetchWeeztixStats() {
       if (pctDoor >= 0.70 && !doorAlerts.p70) { doorAlerts.p70 = true; await broadcastAlert(`🚪 Porta: 70% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}`); }
       if (pctDoor >= 0.85 && !doorAlerts.p85) { doorAlerts.p85 = true; await broadcastAlert(`⚠️ Porta: 85% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nOcchio fila / sicurezza.`); }
       if (pctDoor >= 0.95 && !doorAlerts.p95) { doorAlerts.p95 = true; await broadcastAlert(`🚨 Porta: 95% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nValuta STOP ingressi.`); }
+    }
+
+    // Per-ticket-wave alerts
+    if (alertSubscribers.size > 0) {
+      for (const t of weeztixTicketStats) {
+        const cap = weeztixCapByTicketId[t.id];
+        if (!cap || cap <= 0) continue;
+        const sold = Number(t.sold) || 0;
+        const remaining = Math.max(0, cap - sold);
+        const pct = sold / cap;
+        const label = ticketLabel(t.id);
+        const state = getTicketAlertState(t.id);
+
+        if (pct >= 0.80 && !state.p80) {
+          state.p80 = true;
+          await broadcastAlert(`🔥 ${label}: 80% esaurito\nVenduti: ${sold}/${cap} | Rimasti: ${remaining}`);
+        }
+        if (pct >= 0.90 && !state.p90) {
+          state.p90 = true;
+          await broadcastAlert(`🚀 ${label}: 90% esaurito\nVenduti: ${sold}/${cap} | Rimasti: ${remaining}`);
+        }
+        if (pct >= 1.00 && !state.p100) {
+          state.p100 = true;
+          await broadcastAlert(`🟥 ${label}: ESAURITO\nVenduti: ${sold}/${cap} | Rimasti: 0`);
+        }
+      }
     }
 
   } catch (e) {
@@ -1045,7 +1079,7 @@ app.post('/webhook', (req, res) => {
       // --- alerts ---
       if (text.startsWith('/alerts_on')) {
         alertSubscribers.add(chatId);
-        await tgSend(chatId, '🔔 Alert attivati (sell-out + porta se disponibile).');
+        await tgSend(chatId, '🔔 Alert attivati.\nRiceverai notifiche al 80%, 90% e 100% (esaurito) per ogni wave.');
         return;
       }
 
@@ -1109,6 +1143,7 @@ app.post('/webhook', (req, res) => {
         weeztixCapByTicketId = {};
         weeztixCapMetaByTicketId = {};
         weeztixCapLastOkAt = null;
+        ticketWaveAlerts.clear();
         await fetchCapacitiesFromApi();
         const count = Object.keys(weeztixCapByTicketId).length;
         await tgSend(chatId, count
