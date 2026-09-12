@@ -27,6 +27,19 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
+
+// Reuse TCP/TLS connections. Every outbound call (Weeztix, Redis, Telegram)
+// otherwise pays a fresh handshake, and a cold command makes half a dozen.
+const KEEP_ALIVE = { keepAlive: true, keepAliveMsecs: 15000, maxSockets: 32 };
+axios.defaults.httpAgent = new http.Agent(KEEP_ALIVE);
+axios.defaults.httpsAgent = new https.Agent(KEEP_ALIVE);
+
+// -------------------- Timeouts --------------------
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 10000);
+const STATS_TIMEOUT_MS = Number(process.env.STATS_TIMEOUT_MS || 12000);
+const REDIS_TIMEOUT_MS = Number(process.env.REDIS_TIMEOUT_MS || 5000);
 
 const app = express();
 app.use(express.json());
@@ -40,7 +53,12 @@ if (!BOT_TOKEN) {
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 async function tgSend(chatId, text) {
-  await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text }, { timeout: 15000 });
+  await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text }, { timeout: HTTP_TIMEOUT_MS });
+}
+
+// Fire-and-forget notice, so telling the user "working on it" costs no latency.
+function ack(chatId, message) {
+  tgSend(chatId, message).catch(() => {});
 }
 
 // Telegram message size limit: chunk long replies safely
@@ -54,7 +72,7 @@ async function tgSendLong(chatId, text, chunkSize = 3500) {
 // -------------------- Generic retry helper --------------------
 async function withRetry(fn, {
   retries = 2,
-  initialDelayMs = 800,
+  initialDelayMs = 400,
   factor = 2,
   shouldRetry = (err) => {
     const status = err?.response?.status;
@@ -117,7 +135,7 @@ async function redisGet(key) {
     const url = `${REDIS_URL}/get/${encodeURIComponent(key)}`;
     const r = await axios.post(url, null, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
-      timeout: 10000
+      timeout: REDIS_TIMEOUT_MS
     });
     return typeof r.data?.result === 'string' ? r.data.result : null;
   } catch (e) {
@@ -135,7 +153,7 @@ async function redisSet(key, value) {
         Authorization: `Bearer ${REDIS_TOKEN}`,
         'Content-Type': 'text/plain'
       },
-      timeout: 10000
+      timeout: REDIS_TIMEOUT_MS
     });
   } catch (e) {
     console.error('Redis SET error:', e?.response?.data || e.message || e);
@@ -283,7 +301,7 @@ async function refreshAccessToken() {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Authorization': `Basic ${basicAuth}`
       },
-      timeout: 15000
+      timeout: HTTP_TIMEOUT_MS
     });
 
     const at = r.data?.access_token;
@@ -292,6 +310,11 @@ async function refreshAccessToken() {
     if (!at || typeof at !== 'string' || dotCount < 2) throw new Error('Non-JWT access_token');
 
     WEEZTIX_ACCESS_TOKEN = at;
+    const ttlSec = Number(r.data?.expires_in) || 1800;
+    WEEZTIX_ACCESS_TOKEN_EXP = Date.now() + ttlSec * 1000;
+    // Cached so the next cold start skips this round trip entirely. Not awaited:
+    // a slow cache write must not delay the caller. A stale hit self-heals on 401.
+    redisSet(ACCESS_TOKEN_KEY, JSON.stringify({ token: at, exp: WEEZTIX_ACCESS_TOKEN_EXP }));
 
     if (r.data.refresh_token && typeof r.data.refresh_token === 'string') {
       WEEZTIX_REFRESH_TOKEN_RUNTIME = r.data.refresh_token;
@@ -313,8 +336,32 @@ async function refreshAccessToken() {
   }
 }
 
+const ACCESS_TOKEN_KEY = 'weeztix_access_token';
+let WEEZTIX_ACCESS_TOKEN_EXP = 0; // epoch ms
+
+function invalidateAccessToken() {
+  WEEZTIX_ACCESS_TOKEN = null;
+  WEEZTIX_ACCESS_TOKEN_EXP = 0;
+}
+
 async function ensureAccessToken() {
-  if (!WEEZTIX_ACCESS_TOKEN) await refreshAccessToken();
+  if (WEEZTIX_ACCESS_TOKEN && Date.now() < WEEZTIX_ACCESS_TOKEN_EXP - 60000) return;
+
+  if (!WEEZTIX_ACCESS_TOKEN) {
+    const cached = await redisGet(ACCESS_TOKEN_KEY);
+    if (cached) {
+      try {
+        const obj = JSON.parse(cached);
+        if (obj?.token && Date.now() < Number(obj.exp) - 60000) {
+          WEEZTIX_ACCESS_TOKEN = obj.token;
+          WEEZTIX_ACCESS_TOKEN_EXP = Number(obj.exp);
+          return;
+        }
+      } catch (_) {}
+    }
+  }
+
+  await refreshAccessToken();
 }
 
 // -------------------- Robust parsing of WEEZTIX_EVENT_GUID + ?as=... --------------------
@@ -357,7 +404,7 @@ async function fetchCompanyGuidIfNeeded() {
   try {
     const r = await axios.get('https://auth.weeztix.com/users/me', {
       headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
-      timeout: 15000
+      timeout: HTTP_TIMEOUT_MS
     });
 
     const data = r.data || {};
@@ -385,14 +432,30 @@ async function fetchCompanyGuidIfNeeded() {
   }
 }
 
-async function weeztixGet(path, { timeout = 20000, companyScoped = false } = {}) {
-  await ensureAccessToken();
-  const headers = { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` };
-  if (companyScoped) {
-    const cg = await fetchCompanyGuidIfNeeded();
-    if (cg) headers['Company'] = cg;
+async function weeztixGet(path, { timeout = HTTP_TIMEOUT_MS, companyScoped = false } = {}) {
+  const doGet = async () => {
+    await ensureAccessToken();
+    const headers = { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` };
+    if (companyScoped) {
+      const cg = await fetchCompanyGuidIfNeeded();
+      if (cg) headers['Company'] = cg;
+    }
+    return axios.get(`${WEEZTIX_API_BASE}${path}`, { headers, timeout });
+  };
+
+  try {
+    return await doGet();
+  } catch (e) {
+    const status = e?.response?.status;
+    const msg = e?.response?.data?.error_description || '';
+    // A cached token can outlive its stated expiry; refresh once and retry.
+    if (status === 401 || (status === 400 && msg.includes('JWT'))) {
+      invalidateAccessToken();
+      await refreshAccessToken();
+      return await doGet();
+    }
+    throw e;
   }
-  return axios.get(`${WEEZTIX_API_BASE}${path}`, { headers, timeout });
 }
 
 // -------------------- Stats polling --------------------
@@ -467,7 +530,16 @@ function parseWeeztixStats(data) {
   return out;
 }
 
-async function fetchWeeztixStats() {
+let STATS_IN_FLIGHT = null;
+
+// Concurrent commands and the poller share one fetch instead of stampeding the API.
+function fetchWeeztixStats() {
+  if (STATS_IN_FLIGHT) return STATS_IN_FLIGHT;
+  STATS_IN_FLIGHT = fetchWeeztixStatsOnce().finally(() => { STATS_IN_FLIGHT = null; });
+  return STATS_IN_FLIGHT;
+}
+
+async function fetchWeeztixStatsOnce() {
   try {
     if (!WEEZTIX_EVENT_GUID) {
       weeztixLastError = 'Missing WEEZTIX_EVENT_GUID';
@@ -480,19 +552,20 @@ async function fetchWeeztixStats() {
       await ensureAccessToken();
       return axios.get(statsUrl, {
         headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
-        timeout: 30000
+        timeout: STATS_TIMEOUT_MS
       });
     };
 
     let resp;
     try {
-      resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+      resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 400 });
     } catch (e) {
       const status = e?.response?.status;
       const msg = e?.response?.data?.error_description || '';
       if (status === 401 || (status === 400 && msg.includes('JWT'))) {
+        invalidateAccessToken();
         await refreshAccessToken();
-        resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+        resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 400 });
       } else {
         throw e;
       }
@@ -520,6 +593,8 @@ async function fetchWeeztixStats() {
     const cutoff = Date.now() - SERIES_KEEP_MS;
     while (statsSeries.length && statsSeries[0].ts < cutoff) statsSeries.shift();
 
+    persistStatsSnapshot();
+
     // Alerts
     if (MP_CAPACITY > 0 && alertSubscribers.size > 0) {
       const pctSold = soldTotalNow / MP_CAPACITY;
@@ -540,7 +615,7 @@ async function fetchWeeztixStats() {
     const code = e?.code;
     const status = e?.response?.status;
     const dataStr = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 800) : '';
-    if (code === 'ECONNABORTED') weeztixLastError = `Timeout: stats call exceeded 30000ms`;
+    if (code === 'ECONNABORTED') weeztixLastError = `Timeout: stats call exceeded ${STATS_TIMEOUT_MS}ms`;
     else if (status) weeztixLastError = `HTTP ${status}: ${dataStr || '(no body)'}`;
     else weeztixLastError = e?.message || String(e);
   }
@@ -557,11 +632,90 @@ function lastOkAgeMs() {
   return Number.isFinite(ts) ? (Date.now() - ts) : Infinity;
 }
 
-async function ensureStatsFresh() {
-  if (lastOkAgeMs() > STATS_MAX_AGE_MS) {
-    console.log('⏳ Cold-start or stale stats → auto-polling now...');
-    await fetchWeeztixStats();
+// The instance spins down on Render free, taking all in-memory stats with it.
+// Mirroring each poll to Redis lets the next cold instance answer from cache
+// instead of making the user wait for a full OAuth + stats round trip.
+const STATS_SNAPSHOT_KEY = 'weeztix_stats_snapshot';
+const SNAPSHOT_MIN_WRITE_INTERVAL_MS = 60 * 1000;
+let lastSnapshotWriteAt = 0;
+
+// Full resolution for the last 2h (all /trend and /night actually read), one point
+// per 10 min before that — keeps the payload small enough to write on every poll.
+function thinSeries(series) {
+  const detailedFrom = Date.now() - 2 * 60 * 60 * 1000;
+  const out = [];
+  let lastCoarseTs = 0;
+  for (const point of series) {
+    if (point.ts >= detailedFrom) {
+      out.push(point);
+    } else if (point.ts - lastCoarseTs >= 10 * 60 * 1000) {
+      out.push(point);
+      lastCoarseTs = point.ts;
+    }
   }
+  return out;
+}
+
+function persistStatsSnapshot(force = false) {
+  if (!redisAvailable() || !weeztixLastOkAt) return;
+  if (!force && Date.now() - lastSnapshotWriteAt < SNAPSHOT_MIN_WRITE_INTERVAL_MS) return;
+  lastSnapshotWriteAt = Date.now();
+  // Not awaited: the reply must never wait on a cache write.
+  redisSet(STATS_SNAPSHOT_KEY, JSON.stringify({
+    ts: weeztixLastOkAt,
+    stats: weeztixTicketStats,
+    series: thinSeries(statsSeries)
+  }));
+}
+
+// Returns the age of what is now in memory, so callers can decide whether to wait
+// for a live poll. Never replaces fresher in-memory data with an older snapshot.
+async function hydrateStatsFromRedis() {
+  const cached = await redisGet(STATS_SNAPSHOT_KEY);
+  if (!cached) return lastOkAgeMs();
+
+  try {
+    const obj = JSON.parse(cached);
+    if (!obj?.ts || !Array.isArray(obj.stats) || !obj.stats.length) return lastOkAgeMs();
+
+    const age = Date.now() - Date.parse(obj.ts);
+    if (!Number.isFinite(age) || age >= lastOkAgeMs()) return lastOkAgeMs();
+
+    weeztixTicketStats = obj.stats;
+    weeztixLastOkAt = obj.ts;
+    if (Array.isArray(obj.series) && obj.series.length > statsSeries.length) {
+      statsSeries.length = 0;
+      statsSeries.push(...obj.series);
+    }
+    console.log(`♻️ Hydrated stats from Redis (age ${Math.round(age / 1000)}s)`);
+    return age;
+  } catch (_) {
+    return lastOkAgeMs();
+  }
+}
+
+async function ensureStatsFresh() {
+  if (lastOkAgeMs() <= STATS_MAX_AGE_MS) return;
+
+  // Cold start: answer from the previous instance's snapshot and refresh behind
+  // the reply, rather than blocking the user on the full API chain.
+  const age = await hydrateStatsFromRedis();
+  if (age <= STATS_MAX_AGE_MS) {
+    fetchWeeztixStats().catch(() => {});
+    return;
+  }
+
+  console.log('⏳ Cold-start or stale stats → auto-polling now...');
+  await fetchWeeztixStats();
+}
+
+// Tell the user we are working only if the reply is actually taking a while:
+// a cache hit answers in well under this delay and needs no filler message.
+const SLOW_ACK_DELAY_MS = 700;
+
+function slowAck(chatId, message = '⏳ Recupero i dati da Weeztix…') {
+  const timer = setTimeout(() => ack(chatId, message), SLOW_ACK_DELAY_MS);
+  return () => clearTimeout(timer);
 }
 
 // -------------------- Capacities (deep extraction + HARD OVERRIDE for available_stock) --------------------
@@ -718,7 +872,11 @@ async function fetchCapacitiesFromApi() {
   const combinedNameById = {};
   const combinedPriceById = {};
 
-  for (const guid of eventGuids) {
+  // The events are independent: fetch them concurrently, then merge in the original
+  // order so a later event still overrides an earlier one on conflicting ticket ids.
+  const perEvent = await Promise.all(eventGuids.map(async (guid) => {
+    const out = { names: {}, prices: {}, caps: {}, metas: {}, debug: [] };
+
     const pathsToTry = [
       `/event/${guid}/ticket${qs}`,
       `/event/${guid}/tickets${qs}`,
@@ -727,14 +885,14 @@ async function fetchCapacitiesFromApi() {
     for (const path of pathsToTry) {
       try {
         const r = await withRetry(
-          () => weeztixGet(path, { timeout: 20000, companyScoped: true }),
-          { retries: 1, initialDelayMs: 500 }
+          () => weeztixGet(path, { timeout: HTTP_TIMEOUT_MS, companyScoped: true }),
+          { retries: 1, initialDelayMs: 400 }
         );
 
         const data = r.data;
         const arr = extractTicketArray(data);
 
-        weeztixCapDebug.push({
+        out.debug.push({
           path,
           ok: true,
           hasArray: !!arr,
@@ -748,23 +906,33 @@ async function fetchCapacitiesFromApi() {
           const id = extractTicketId(t);
           if (!id) continue;
 
-           const tName = t.name || t.title || t.label;
-          if (tName) combinedNameById[String(id)] = isNight ? `${tName} (Night)` : tName;
-          if (typeof t.min_price === 'number') combinedPriceById[String(id)] = t.min_price / 100;
+          const tName = t.name || t.title || t.label;
+          if (tName) out.names[String(id)] = isNight ? `${tName} (Night)` : tName;
+          if (typeof t.min_price === 'number') out.prices[String(id)] = t.min_price / 100;
 
           const { cap, meta } = extractCapacityDeep(t, soldById);
           if (cap != null) {
-            combinedMap[String(id)] = cap;
-            if (meta) combinedMetaMap[String(id)] = meta;
+            out.caps[String(id)] = cap;
+            if (meta) out.metas[String(id)] = meta;
           }
         }
 
         // Got data for this event; skip the fallback path for this guid
         break;
       } catch (e) {
-        weeztixCapDebug.push({ path, ok: false, status: e?.response?.status, msg: e?.message });
+        out.debug.push({ path, ok: false, status: e?.response?.status, msg: e?.message });
       }
     }
+
+    return out;
+  }));
+
+  for (const ev of perEvent) {
+    weeztixCapDebug.push(...ev.debug);
+    Object.assign(combinedNameById, ev.names);
+    Object.assign(combinedPriceById, ev.prices);
+    Object.assign(combinedMap, ev.caps);
+    Object.assign(combinedMetaMap, ev.metas);
   }
 
   if (Object.keys(combinedNameById).length || Object.keys(combinedMap).length) {
@@ -782,7 +950,7 @@ async function fetchCapacitiesFromApi() {
   weeztixCapLastError = 'Could not auto-detect ticket capacities from API (endpoint/fields differ). Use /ticket_raw + /capacities_debug.';
 }
 
-async function ensureCapacitiesFresh() {
+async function ensureCapacitiesFresh({ statsPromise = null } = {}) {
   if (capAgeMs() <= CAP_CACHE_MAX_AGE_MS && Object.keys(weeztixCapByTicketId).length) return;
 
   const cached = await redisGet('weeztix_ticket_capacities');
@@ -804,6 +972,10 @@ async function ensureCapacitiesFresh() {
       }
     } catch (_) {}
   }
+
+  // Only the live fetch depends on sold counts, so this is the one place that has
+  // to wait for stats — the memory and Redis hits above stay fully parallel.
+  if (statsPromise) { try { await statsPromise; } catch (_) {} }
 
   await fetchCapacitiesFromApi();
 }
@@ -898,7 +1070,7 @@ async function fetchCouponCodesBestEffort(couponGuid) {
 
   for (const p of paths) {
     try {
-      const r = await weeztixGet(p, { timeout: 20000, companyScoped: true });
+      const r = await weeztixGet(p, { timeout: HTTP_TIMEOUT_MS, companyScoped: true });
       const data = r.data;
 
       const embedded = extractCouponCodesFromObject(data);
@@ -919,12 +1091,21 @@ async function fetchCouponCodesBestEffort(couponGuid) {
 }
 
 async function handlePasswordsCommand(chatId) {
+  const cancelAck = slowAck(chatId, '🔑 Cerco i promo code attivi…');
+  try {
+    await handlePasswordsCommandInner(chatId);
+  } finally {
+    cancelAck();
+  }
+}
+
+async function handlePasswordsCommandInner(chatId) {
   await ensureAccessToken();
   await fetchCompanyGuidIfNeeded();
 
   let coupons = [];
   try {
-    const r = await weeztixGet(`/coupon/normal${qsForDashboard()}`, { timeout: 25000, companyScoped: true });
+    const r = await weeztixGet(`/coupon/normal${qsForDashboard()}`, { timeout: HTTP_TIMEOUT_MS, companyScoped: true });
     coupons = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.results) ? r.data.results : []);
   } catch (e) {
     const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 1200) : (e?.message || String(e));
@@ -941,7 +1122,8 @@ async function handlePasswordsCommand(chatId) {
   const lines = [];
   lines.push('🔑 PASSWORDS (promo codes attivi)\n');
 
-  for (const c of coupons) {
+  // Coupons are independent: resolve their codes concurrently, then emit in order.
+  const perCoupon = await Promise.all(coupons.map(async (c) => {
     const guid = c?.guid || c?.id;
     const name = c?.name || c?.title || c?.description || '(coupon)';
     const ticketGuids = extractCouponTicketGuids(c);
@@ -950,10 +1132,11 @@ async function handlePasswordsCommand(chatId) {
     let codes = extractCouponCodesFromObject(c);
     if (!codes.length && guid) codes = await fetchCouponCodesBestEffort(guid);
 
-    for (const code of codes) {
-      lines.push(`• ${code} — ${name}${ticketLabels.length ? ` → ${ticketLabels.join(', ')}` : ''}`);
-    }
-  }
+    return codes.map(code =>
+      `• ${code} — ${name}${ticketLabels.length ? ` → ${ticketLabels.join(', ')}` : ''}`);
+  }));
+
+  for (const group of perCoupon) lines.push(...group);
 
   await tgSendLong(chatId, lines.join('\n'));
 }
@@ -1043,6 +1226,7 @@ app.post('/webhook', (req, res) => {
 
       if (text.startsWith('/poll_now')) {
         await fetchWeeztixStats();
+        persistStatsSnapshot(true);
         await tgSend(chatId, `✅ Poll fatto.\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
         return;
       }
@@ -1061,7 +1245,7 @@ app.post('/webhook', (req, res) => {
       }
 
       // --- debugging ---
-      if (text.startsWith('/debugweeztix')) {
+      if (text.startsWith('/debugweeztix') && !text.startsWith('/debugweeztix_raw')) {
         await ensureStatsFresh();
         const sample = weeztixTicketStats.slice(0, 12)
           .map(t => `• ${ticketLabel(t.id)} (${t.id.slice(0, 8)}…) | sold=${t.sold} | scanned=${t.scanned}`)
@@ -1124,6 +1308,7 @@ app.post('/webhook', (req, res) => {
         weeztixCapByTicketId = {};
         weeztixCapMetaByTicketId = {};
         weeztixCapLastOkAt = null;
+        await ensureStatsFresh();
         await fetchCapacitiesFromApi();
         const count = Object.keys(weeztixCapByTicketId).length;
         await tgSend(chatId, count
@@ -1133,14 +1318,24 @@ app.post('/webhook', (req, res) => {
       }
  
       if (text.startsWith('/biglietti')) {
-        await ensureStatsFresh();
-        await ensureCapacitiesFresh();
+        const cancelAck = slowAck(chatId);
+
+        // Independent work: the capacity lookup normally resolves from cache while
+        // the stats fetch is still in flight.
+        const statsPromise = ensureStatsFresh()
+          .catch((e) => console.error('stats refresh error:', e?.message || e));
+        try {
+          await ensureCapacitiesFresh({ statsPromise });
+          await statsPromise;
+        } finally {
+          cancelAck();
+        }
 
         const { grouped: soldByLabel, total: soldTotal } = groupSoldByLabel();
         const { grouped: capByLabel } = groupCapacityByLabel();
- 
+
         if (!weeztixTicketStats.length && !Object.keys(capByLabel).length) {
-               await tgSend(chatId,
+          await tgSend(chatId,
             `🎟️ Nessun dato ancora.\n\n` +
             `Stats — Ultimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\n\n` +
             `Capacità — Ultimo OK: ${weeztixCapLastOkAt || 'mai'}\nErrore: ${weeztixCapLastError || '—'}\n\n` +
@@ -1149,22 +1344,7 @@ app.post('/webhook', (req, res) => {
           return;
         }
 
-               const allLabelSet = new Set([...Object.keys(soldByLabel), ...Object.keys(capByLabel)]);
-        const labels = [...allLabelSet].sort((a, b) => a.localeCompare(b, 'it'));
-        const lines = labels.map(label => {
-          const sold = soldByLabel[label] || 0;
-          const cap = capByLabel[label];
-          const price = priceByLabel[label];
-          const priceStr = typeof price === 'number' ? ` | €${price.toFixed(2)}/cad` : '';
-          if (typeof cap === 'number' && cap > 0) {
-            const remaining = Math.max(0, cap - sold);
-            return `• ${label}${priceStr}: sold=${sold} | remaining=${remaining}/${cap}`;
-          }
-           return `• ${label}: sold=${sold} | remaining=n/d`;
-          return `• ${label}${priceStr}: sold=${sold} | remaining=n/d`;
-        }).join('\n');
-
-         // Build price-per-label map
+        // Build the price map before rendering the lines that read it.
         const priceByLabel = {};
         for (const t of weeztixTicketStats) {
           const label = ticketLabel(t.id);
@@ -1179,6 +1359,20 @@ app.post('/webhook', (req, res) => {
             if (typeof price === 'number') priceByLabel[label] = price;
           }
         }
+
+        const allLabelSet = new Set([...Object.keys(soldByLabel), ...Object.keys(capByLabel)]);
+        const labels = [...allLabelSet].sort((a, b) => a.localeCompare(b, 'it'));
+        const lines = labels.map(label => {
+          const sold = soldByLabel[label] || 0;
+          const cap = capByLabel[label];
+          const price = priceByLabel[label];
+          const priceStr = typeof price === 'number' ? ` | €${price.toFixed(2)}/cad` : '';
+          if (typeof cap === 'number' && cap > 0) {
+            const remaining = Math.max(0, cap - sold);
+            return `• ${label}${priceStr}: sold=${sold} | remaining=${remaining}/${cap}`;
+          }
+          return `• ${label}${priceStr}: sold=${sold} | remaining=n/d`;
+        }).join('\n');
  
 
         let revenue = 0;
@@ -1206,7 +1400,8 @@ app.post('/webhook', (req, res) => {
 
       // --- trend ---
       if (text.startsWith('/trend')) {
-        await ensureStatsFresh();
+        const cancelAck = slowAck(chatId);
+        try { await ensureStatsFresh(); } finally { cancelAck(); }
 
         if (statsSeries.length < 2) {
           await tgSend(chatId, '📈 Trend: serve qualche minuto di dati. Fai /poll_now e riprova tra 2–3 minuti.');
@@ -1256,7 +1451,8 @@ app.post('/webhook', (req, res) => {
 
       // --- night ---
       if (text.startsWith('/night')) {
-        await ensureStatsFresh();
+        const cancelAck = slowAck(chatId);
+        try { await ensureStatsFresh(); } finally { cancelAck(); }
 
         if (statsSeries.length < 2) {
           await tgSend(chatId, '🌙 Event Night: serve qualche punto dati. Fai /poll_now e riprova tra 2–3 minuti.');
@@ -1324,7 +1520,20 @@ process.on('uncaughtException', (err) => {
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => console.log('Bot live on port', PORT));
+
 server.on('error', (err) => {
   console.error('Server listen error:', err);
   process.exit(1);
 });
+
+// setInterval fires its first tick a full poll period after boot, so a fresh
+// instance would otherwise have no data at all for WEEZTIX_POLL_SECONDS.
+(async () => {
+  try {
+    await hydrateStatsFromRedis();
+    await fetchWeeztixStats();
+    await ensureCapacitiesFresh();
+  } catch (e) {
+    console.error('Warm-up error:', e?.message || e);
+  }
+})();
