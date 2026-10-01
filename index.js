@@ -37,9 +37,13 @@ axios.defaults.httpAgent = new http.Agent(KEEP_ALIVE);
 axios.defaults.httpsAgent = new https.Agent(KEEP_ALIVE);
 
 // -------------------- Timeouts --------------------
-const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 10000);
-const STATS_TIMEOUT_MS = Number(process.env.STATS_TIMEOUT_MS || 12000);
-const REDIS_TIMEOUT_MS = Number(process.env.REDIS_TIMEOUT_MS || 5000);
+// Defaults match the values this bot shipped with. The stats dashboard in particular
+// can be slow; cutting its timeout makes it fail every time and leaves /biglietti
+// with no sales data. Lower them via env only after measuring the real latency.
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 15000);   // Telegram, OAuth
+const API_TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 20000);     // Weeztix REST
+const STATS_TIMEOUT_MS = Number(process.env.STATS_TIMEOUT_MS || 30000); // stats dashboard
+const REDIS_TIMEOUT_MS = Number(process.env.REDIS_TIMEOUT_MS || 10000); // a lost write drops a rotated refresh token
 
 const app = express();
 app.use(express.json());
@@ -432,7 +436,7 @@ async function fetchCompanyGuidIfNeeded() {
   }
 }
 
-async function weeztixGet(path, { timeout = HTTP_TIMEOUT_MS, companyScoped = false } = {}) {
+async function weeztixGet(path, { timeout = API_TIMEOUT_MS, companyScoped = false } = {}) {
   const doGet = async () => {
     await ensureAccessToken();
     const headers = { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` };
@@ -885,7 +889,7 @@ async function fetchCapacitiesFromApi() {
     for (const path of pathsToTry) {
       try {
         const r = await withRetry(
-          () => weeztixGet(path, { timeout: HTTP_TIMEOUT_MS, companyScoped: true }),
+          () => weeztixGet(path, { timeout: API_TIMEOUT_MS, companyScoped: true }),
           { retries: 1, initialDelayMs: 400 }
         );
 
@@ -1070,7 +1074,7 @@ async function fetchCouponCodesBestEffort(couponGuid) {
 
   for (const p of paths) {
     try {
-      const r = await weeztixGet(p, { timeout: HTTP_TIMEOUT_MS, companyScoped: true });
+      const r = await weeztixGet(p, { timeout: API_TIMEOUT_MS, companyScoped: true });
       const data = r.data;
 
       const embedded = extractCouponCodesFromObject(data);
@@ -1105,7 +1109,7 @@ async function handlePasswordsCommandInner(chatId) {
 
   let coupons = [];
   try {
-    const r = await weeztixGet(`/coupon/normal${qsForDashboard()}`, { timeout: HTTP_TIMEOUT_MS, companyScoped: true });
+    const r = await weeztixGet(`/coupon/normal${qsForDashboard()}`, { timeout: 25000, companyScoped: true });
     coupons = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.results) ? r.data.results : []);
   } catch (e) {
     const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 1200) : (e?.message || String(e));
@@ -1360,6 +1364,11 @@ app.post('/webhook', (req, res) => {
           }
         }
 
+        // Capacities come from a 6h cache but sold counts come from one live call. When
+        // that call has failed there are no stats rows, and printing sold=0 would pass a
+        // failed fetch off as "nothing sold". Say so instead.
+        const salesKnown = weeztixTicketStats.length > 0;
+
         const allLabelSet = new Set([...Object.keys(soldByLabel), ...Object.keys(capByLabel)]);
         const labels = [...allLabelSet].sort((a, b) => a.localeCompare(b, 'it'));
         const lines = labels.map(label => {
@@ -1367,13 +1376,27 @@ app.post('/webhook', (req, res) => {
           const cap = capByLabel[label];
           const price = priceByLabel[label];
           const priceStr = typeof price === 'number' ? ` | €${price.toFixed(2)}/cad` : '';
+          if (!salesKnown) {
+            return `• ${label}${priceStr}: sold=n/d | cap=${typeof cap === 'number' && cap > 0 ? cap : 'n/d'}`;
+          }
           if (typeof cap === 'number' && cap > 0) {
             const remaining = Math.max(0, cap - sold);
             return `• ${label}${priceStr}: sold=${sold} | remaining=${remaining}/${cap}`;
           }
           return `• ${label}${priceStr}: sold=${sold} | remaining=n/d`;
         }).join('\n');
- 
+
+        let statsWarning = '';
+        if (!salesKnown) {
+          statsWarning =
+            `⚠️ Vendite non disponibili: nessun dato dalle statistiche Weeztix.\n` +
+            `Errore: ${String(weeztixLastError || 'nessuna risposta').slice(0, 300)}\n` +
+            `Riprova con /poll_now.\n\n`;
+        } else if (weeztixLastError) {
+          statsWarning =
+            `⚠️ Ultimo aggiornamento fallito, dati del ${weeztixLastOkAt}.\n` +
+            `Errore: ${String(weeztixLastError).slice(0, 300)}\n\n`;
+        }
 
         let revenue = 0;
         for (const t of weeztixTicketStats) {
@@ -1382,7 +1405,7 @@ app.post('/webhook', (req, res) => {
         }
 
         let soldPctLine = '';
-        if (MP_CAPACITY > 0) {
+        if (MP_CAPACITY > 0 && salesKnown) {
           const pct = Math.round((soldTotal / MP_CAPACITY) * 100);
           soldPctLine = `\n📊 Sold-out: ${pct}% (${soldTotal}/${MP_CAPACITY})`;
         }
@@ -1393,7 +1416,11 @@ app.post('/webhook', (req, res) => {
 
         await tgSend(
           chatId,
-          `🎟 BIGLIETTI\n\n${lines}\n\nTotale sold: ${soldTotal}${soldPctLine}\n💸 Revenue stimata: €${revenue.toFixed(2)}\nAggiornato: ${weeztixLastOkAt || weeztixCapLastOkAt}${capNote}`
+          `🎟 BIGLIETTI\n\n${statsWarning}${lines}\n\n` +
+          (salesKnown
+            ? `Totale sold: ${soldTotal}${soldPctLine}\n💸 Revenue stimata: €${revenue.toFixed(2)}\n`
+            : `Totale sold: n/d\n`) +
+          `Aggiornato: ${weeztixLastOkAt || weeztixCapLastOkAt}${capNote}`
         );
         return;
       }

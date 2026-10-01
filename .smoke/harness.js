@@ -1,6 +1,9 @@
 /* Smoke test: stub every outbound HTTP call, boot the bot, drive it via /webhook. */
 const axios = require('axios');
 
+const SCENARIO = process.argv[2] || 'healthy';
+const STATS_DELAY_MS = SCENARIO === 'stats-timeout' ? 1500 : 0;
+
 const sentToTelegram = [];
 const calls = [];
 let statsCallCount = 0;
@@ -47,6 +50,13 @@ axios.defaults.adapter = async (config) => {
 
   if (url.includes('/statistics/dashboard/')) {
     statsCallCount++;
+    if (STATS_DELAY_MS > Number(config.timeout || 0)) {
+      // axios enforces config.timeout inside the real adapter; emulate that here.
+      await new Promise(r => setTimeout(r, Number(config.timeout)));
+      const err = new Error(`timeout of ${config.timeout}ms exceeded`);
+      err.code = 'ECONNABORTED';
+      throw err;
+    }
     return reply(config, {
       'Maledetta Primavera': {
         aggregations: {
@@ -90,7 +100,8 @@ process.env.WEEZTIX_REFRESH_TOKEN = 'refresh-1';
 process.env.MP_CAPACITY = '100';
 process.env.REDIS_URL = 'http://redis.local';
 process.env.REDIS_TOKEN = 'rtoken';
-process.env.PORT = '4555';
+process.env.PORT = SCENARIO === 'stats-timeout' ? '4557' : '4555';
+if (SCENARIO === 'stats-timeout') process.env.STATS_TIMEOUT_MS = '150';
 
 require('../index.js');
 
@@ -101,7 +112,7 @@ function postWebhook(text) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify({ message: { chat: { id: 999 }, text } });
     const req = nodeHttp.request({
-      host: '127.0.0.1', port: 4555, path: '/webhook', method: 'POST',
+      host: '127.0.0.1', port: Number(process.env.PORT), path: '/webhook', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
     }, (res) => { res.resume(); res.on('end', resolve); });
     req.on('error', reject);
@@ -109,10 +120,10 @@ function postWebhook(text) {
   });
 }
 
-async function send(text) {
+async function send(text, settleMs = 700) {
   sentToTelegram.length = 0;
   await postWebhook(text);
-  await wait(700);
+  await wait(settleMs);
   return sentToTelegram.slice();
 }
 
@@ -124,6 +135,20 @@ async function send(text) {
     console.log((ok ? 'PASS  ' : 'FAIL  ') + name + (detail ? '\n        ' + detail : ''));
     if (!ok) failures++;
   };
+
+  if (SCENARIO === 'stats-timeout') {
+    const msgs = await send('/biglietti', 4000);
+    const text = msgs.filter(m => m.includes('BIGLIETTI')).join('\n');
+    console.log('--- /biglietti (stats endpoint down) ---\n' + text + '\n--- end ---');
+    check('/biglietti still replies', text.length > 0);
+    check('does NOT report sold=0 as if it were real', !/sold=0\b/.test(text) && !/Totale sold: 0/.test(text),
+          'zeros were presented as real data');
+    check('says sales data is unavailable', /non disponibil/i.test(text));
+    check('surfaces the underlying error', /Timeout/.test(text));
+    check('still shows capacities', /cap=40/.test(text) && /cap=25/.test(text));
+    console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL CHECKS PASSED'));
+    process.exit(failures ? 1 : 0);
+  }
 
   const biglietti = await send('/biglietti');
   console.log('--- /biglietti messages ---\n' + biglietti.join('\n===\n') + '\n--- end ---');

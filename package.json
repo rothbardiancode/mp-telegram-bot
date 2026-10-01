@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test:smoke": "node .smoke/harness.js"
+    "test:smoke": "node .smoke/harness.js && node .smoke/harness.js stats-timeout"
   },
   "dependencies": {
     "express": "^4.18.2",
