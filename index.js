@@ -1151,20 +1151,7 @@ app.post('/webhook', (req, res) => {
 
                const allLabelSet = new Set([...Object.keys(soldByLabel), ...Object.keys(capByLabel)]);
         const labels = [...allLabelSet].sort((a, b) => a.localeCompare(b, 'it'));
-        const lines = labels.map(label => {
-          const sold = soldByLabel[label] || 0;
-          const cap = capByLabel[label];
-          const price = priceByLabel[label];
-          const priceStr = typeof price === 'number' ? ` | €${price.toFixed(2)}/cad` : '';
-          if (typeof cap === 'number' && cap > 0) {
-            const remaining = Math.max(0, cap - sold);
-            return `• ${label}${priceStr}: sold=${sold} | remaining=${remaining}/${cap}`;
-          }
-           return `• ${label}: sold=${sold} | remaining=n/d`;
-          return `• ${label}${priceStr}: sold=${sold} | remaining=n/d`;
-        }).join('\n');
-
-         // Build price-per-label map
+        // Build price-per-label map
         const priceByLabel = {};
         for (const t of weeztixTicketStats) {
           const label = ticketLabel(t.id);
@@ -1179,7 +1166,18 @@ app.post('/webhook', (req, res) => {
             if (typeof price === 'number') priceByLabel[label] = price;
           }
         }
- 
+
+        const lines = labels.map(label => {
+          const sold = soldByLabel[label] || 0;
+          const cap = capByLabel[label];
+          const price = priceByLabel[label];
+          const priceStr = typeof price === 'number' ? ` | €${price.toFixed(2)}/cad` : '';
+          if (typeof cap === 'number' && cap > 0) {
+            const remaining = Math.max(0, cap - sold);
+            return `• ${label}${priceStr}: sold=${sold} | remaining=${remaining}/${cap}`;
+          }
+          return `• ${label}${priceStr}: sold=${sold} | remaining=n/d`;
+        }).join('\n');
 
         let revenue = 0;
         for (const t of weeztixTicketStats) {
