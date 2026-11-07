@@ -1356,7 +1356,35 @@ process.on('uncaughtException', (err) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => console.log('Bot live on port', PORT));
+// -------------------- Register Telegram webhook on startup --------------------
+// Telegram only knows the webhook URL if someone set it. Re-register on every boot so a
+// removed/changed webhook (or a redeploy to a new URL) heals itself.
+// URL = WEBHOOK_URL if set (full URL), else RENDER_EXTERNAL_URL (set by Render) + /webhook.
+async function ensureWebhook() {
+  const base = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+  const url = process.env.WEBHOOK_URL || (base ? `${base}/webhook` : '');
+  if (!url) {
+    console.warn('⚠️ No WEBHOOK_URL / RENDER_EXTERNAL_URL: skipping setWebhook');
+    return;
+  }
+  try {
+    const info = (await axios.get(`${TELEGRAM_API}/getWebhookInfo`, { timeout: 15000 })).data?.result || {};
+    if (info.url !== url) {
+      await axios.post(`${TELEGRAM_API}/setWebhook`, { url }, { timeout: 15000 });
+      console.log(`🔗 Webhook set to ${url} (was: ${info.url || 'none'})`);
+    } else {
+      console.log(`🔗 Webhook already correct: ${url}`);
+    }
+    if (info.last_error_message) console.warn('Telegram last webhook error:', info.last_error_message);
+  } catch (e) {
+    console.error('setWebhook failed:', e?.response?.data || e.message || e);
+  }
+}
+
+const server = app.listen(PORT, () => {
+  console.log('Bot live on port', PORT);
+  ensureWebhook();
+});
 server.on('error', (err) => {
   console.error('Server listen error:', err);
   process.exit(1);
