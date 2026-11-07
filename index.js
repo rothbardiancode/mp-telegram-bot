@@ -1016,6 +1016,47 @@ async function handleTicketRaw(chatId) {
   }
 }
 
+// Probe likely Weeztix order/transaction endpoints and show status + shape of each,
+// so we can see which one returns per-order data (timestamps, emails, amounts).
+async function handleOrdersDebug(chatId) {
+  const qs = qsForDashboard();
+  const sep = qs ? '&' : '?';
+  const g = WEEZTIX_EVENT_GUID;
+  const paths = [
+    `/order${qs}`,
+    `/orders${qs}`,
+    `/transaction${qs}`,
+    `/transactions${qs}`,
+    `/event/${g}/order${qs}`,
+    `/event/${g}/orders${qs}`,
+    `/event/${g}/transaction${qs}`,
+    `/event/${g}/ticket/sold${qs}`,
+    `/order${qs}${sep}event=${g}`,
+    `/transaction${qs}${sep}event=${g}`
+  ];
+
+  const shapeOf = (v, depth = 0) => {
+    if (Array.isArray(v)) return `array(${v.length})`;
+    if (v && typeof v === 'object') return depth ? 'object' : `{${Object.keys(v).slice(0, 25).join(', ')}}`;
+    return typeof v;
+  };
+
+  const lines = [];
+  for (const path of paths) {
+    try {
+      const r = await weeztixGet(path, { timeout: 25000, companyScoped: true });
+      const d = r.data;
+      const arr = extractTicketArray(d) || (Array.isArray(d) ? d : null);
+      lines.push(`✅ ${r.status} ${path}\n   shape: ${shapeOf(d)}${arr ? `\n   items: ${arr.length}\n   first: ${JSON.stringify(arr[0]).slice(0, 1200)}` : `\n   body: ${JSON.stringify(d).slice(0, 600)}`}`);
+    } catch (e) {
+      const st = e?.response?.status || 'ERR';
+      const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 150) : (e?.message || '');
+      lines.push(`❌ ${st} ${path}  ${detail}`);
+    }
+  }
+  await tgSendLong(chatId, `🧪 ORDERS DEBUG\nEvent GUID: ${g}\n\n${lines.join('\n\n')}`);
+}
+
 async function handleCapacitiesDebug(chatId) {
   await ensureStatsFresh();
   await ensureCapacitiesFresh();
@@ -1112,6 +1153,15 @@ app.post('/webhook', (req, res) => {
 
       if (text.startsWith('/ticket_raw')) {
         await handleTicketRaw(chatId);
+        return;
+      }
+
+      if (text.startsWith('/orders_debug')) {
+        try {
+          await handleOrdersDebug(chatId);
+        } catch (e) {
+          await tgSend(chatId, `❌ /orders_debug errore: ${e?.message || String(e)}`);
+        }
         return;
       }
 
