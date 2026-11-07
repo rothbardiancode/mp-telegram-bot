@@ -1,0 +1,16 @@
+# Pings the Render free-tier service so it doesn't spin down and answer
+# Telegram's webhook with 429 while cold-starting.
+# GitHub only runs scheduled workflows from the default branch.
+name: keep-alive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # GitHub may delay runs; 10 min stays under Render's ~15 min idle limit
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping bot
+        run: curl -fsS --retry 3 --retry-delay 10 --max-time 90 https://mp-telegram-bot-den5.onrender.com/
