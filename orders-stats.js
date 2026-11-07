@@ -115,4 +115,32 @@ function formatLast(rows, n = 10) {
     `${i + 1}. ${r.email || '(senza email)'}\n    ${fmtDate(r.ts)} · ${r.tickets} ${r.tickets === 1 ? 'biglietto' : 'biglietti'} · ${eur(r.value)}`).join('\n');
 }
 
-module.exports = { toRow, computeTrend, formatTrend, computeBest, formatBest, formatLast, TZ };
+const dayKeyFmt = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
+const dayKey = (ts) => dayKeyFmt.format(new Date(ts));
+
+// Today (Brussels calendar day) so far vs the same weekday last week, up to the same moment.
+function computeToday(rows, now) {
+  const weekAgo = now - 7 * DAY;
+  const todayKey = dayKey(now), lastKey = dayKey(weekAgo);
+  const today = rows.filter(r => dayKey(r.ts) === todayKey);
+  const lastSoFar = rows.filter(r => dayKey(r.ts) === lastKey && r.ts <= weekAgo);
+  const lastFull = rows.filter(r => dayKey(r.ts) === lastKey);
+  const agg = (a) => ({ tickets: sum(a, 'tickets'), orders: a.length, value: sum(a, 'value') });
+  return { todayKey, lastKey, today: agg(today), lastSoFar: agg(lastSoFar), lastFull: agg(lastFull) };
+}
+
+function formatToday(c) {
+  const d = c.today.tickets - c.lastSoFar.tickets;
+  const sign = d > 0 ? '+' : '';
+  const pct = c.lastSoFar.tickets ? ` (${sign}${Math.round((d / c.lastSoFar.tickets) * 100)}%)` : '';
+  const arrow = d > 0 ? '📈' : d < 0 ? '📉' : '➖';
+  return (
+    `📅 OGGI vs SETTIMANA SCORSA\n\n` +
+    `Oggi (${c.todayKey}) finora: ${c.today.tickets} biglietti, ${c.today.orders} ordini, ${eur(c.today.value)}\n` +
+    `Stesso momento 7 giorni fa (${c.lastKey}): ${c.lastSoFar.tickets} biglietti, ${c.lastSoFar.orders} ordini\n` +
+    `${arrow} Differenza: ${sign}${d} biglietti${pct}\n` +
+    `Giornata intera di 7 giorni fa: ${c.lastFull.tickets} biglietti, ${c.lastFull.orders} ordini, ${eur(c.lastFull.value)}`
+  );
+}
+
+module.exports = { computeToday, formatToday, toRow, computeTrend, formatTrend, computeBest, formatBest, formatLast, TZ };

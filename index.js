@@ -22,6 +22,7 @@
  * Orders stats (/trend_vendite, /best, /last10):
  * ORDERS_SINCE (ISO date, e.g. 2026-10-01) - when sales for the current event started; default: all orders
  * ORDER_CHANNELS (default "shop") - purchase channels counted as sales
+ * NO_SALES_HOURS (default 12; 0 = off) - alert after this many hours without a sale
  *
  * Redis (Upstash REST):
  * REDIS_URL
@@ -1184,7 +1185,9 @@ async function handleOrdersCommand(chatId, kind) {
       await tgSend(chatId, '📭 Nessun ordine pagato trovato' + (ORDERS_SINCE_MS ? ` dal ${process.env.ORDERS_SINCE}` : '') + '.');
       return;
     }
-    if (kind === 'trend') {
+    if (kind === 'today') {
+      await tgSend(chatId, OrderStats.formatToday(OrderStats.computeToday(rows, Date.now())));
+    } else if (kind === 'trend') {
       await tgSend(chatId, OrderStats.formatTrend(OrderStats.computeTrend(rows, Date.now(), ORDERS_SINCE_MS)) +
         (ORDERS_SINCE_MS ? '' : '\n\nℹ️ ORDERS_SINCE non impostato: "dall\'inizio" include tutti gli eventi dello shop.'));
     } else {
@@ -1195,6 +1198,94 @@ async function handleOrdersCommand(chatId, kind) {
     await tgSend(chatId, `❌ Errore ordini: ${detail}`);
   }
 }
+
+// -------------------- Waves (sold / share / revenue / scanned) --------------------
+async function handleWavesCommand(chatId) {
+  await ensureStatsFresh();
+  await ensureCapacitiesFresh();
+  if (!weeztixTicketStats.length) {
+    await tgSend(chatId, `🎟 /waves: nessun dato ancora.\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
+    return;
+  }
+  const by = {};
+  for (const t of weeztixTicketStats) {
+    const label = ticketLabel(t.id);
+    const e = by[label] || (by[label] = { sold: 0, scanned: 0 });
+    e.sold += Number(t.sold || 0);
+    e.scanned += Number(t.scanned || 0);
+  }
+  const { grouped: caps } = groupCapacityByLabel();
+  const totalSold = Object.values(by).reduce((a, e) => a + e.sold, 0);
+  const totalScanned = Object.values(by).reduce((a, e) => a + e.scanned, 0);
+  let revenue = 0;
+  const lines = Object.entries(by).sort((a, b) => b[1].sold - a[1].sold).map(([label, e]) => {
+    const price = PRICE_MAP[label];
+    if (typeof price === 'number') revenue += price * e.sold;
+    const share = totalSold ? Math.round((e.sold / totalSold) * 100) : 0;
+    const cap = caps[label];
+    return `• ${label}: ${e.sold} (${share}%)` +
+      (cap ? ` · cap ${cap}, rimasti ${Math.max(0, cap - e.sold)}` : '') +
+      (typeof price === 'number' && price > 0 ? ` · ~€${(price * e.sold).toFixed(0)}` : '') +
+      (e.scanned ? ` · entrati ${e.scanned} (${Math.round((e.scanned / Math.max(1, e.sold)) * 100)}%)` : '');
+  });
+  await tgSendLong(chatId,
+    `🎟 VENDITE PER WAVE\n\n${lines.join('\n')}\n\n` +
+    `Totale: ${totalSold}${MP_CAPACITY ? `/${MP_CAPACITY}` : ''} venduti · ~€${revenue.toFixed(0)} (prezzi di listino, fee escluse)\n` +
+    (totalScanned ? `🚪 Entrati: ${totalScanned} (${Math.round((totalScanned / Math.max(1, totalSold)) * 100)}% dei venduti)` : '🚪 Entrati: nessuna scansione ancora'));
+}
+
+// -------------------- Promo codes usage (best effort: shows whatever usage fields Weeztix exposes) --------------------
+async function handlePromoCommand(chatId) {
+  let coupons = [];
+  try {
+    const r = await weeztixGet(`/coupon/normal${qsForDashboard()}`, { timeout: 25000, companyScoped: true });
+    coupons = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.results) ? r.data.results : (Array.isArray(r.data?.data) ? r.data.data : []));
+  } catch (e) {
+    const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 800) : (e?.message || String(e));
+    await tgSend(chatId, `❌ /promo: impossibile leggere i coupon.\n${detail}`);
+    return;
+  }
+  coupons = coupons.filter(isCouponEnabled);
+  if (!coupons.length) { await tgSend(chatId, '🏷 /promo: nessun promo code attivo.'); return; }
+
+  const usageKey = /(used|usage|redeem|uses|count|sold|orders)/i;
+  const lines = [];
+  let foundUsage = false;
+  for (const c of coupons) {
+    const name = c?.name || c?.title || c?.description || '(coupon)';
+    const usage = Object.entries(c).filter(([k, v]) => typeof v === 'number' && usageKey.test(k));
+    if (usage.length) foundUsage = true;
+    lines.push(`• ${name}${usage.length ? ' — ' + usage.map(([k, v]) => `${k}=${v}`).join(', ') : ''}`);
+  }
+  await tgSendLong(chatId,
+    `🏷 PROMO CODES (${coupons.length})\n\n${lines.join('\n')}\n\n` +
+    (foundUsage ? '' : `ℹ️ Weeztix non espone l'uso dei coupon in questa lista, né sugli ordini.\nCampi disponibili: ${Object.keys(coupons[0] || {}).join(', ')}`));
+}
+
+// -------------------- No-sales alert --------------------
+// Every 15 min: if the newest paid order is older than NO_SALES_HOURS (default 12; 0 = off),
+// alert once per gap. Only between 09:00 and 23:00 Brussels time, and not once sold out.
+const NO_SALES_HOURS = Number(process.env.NO_SALES_HOURS || 12);
+let noSalesAlertedFor = 0;
+
+async function checkNoSales() {
+  try {
+    if (!NO_SALES_HOURS || selloutAlerts.p100) return;
+    const rows = await loadLatestOrders(1);
+    if (!rows.length) return;
+    const lastTs = Math.max(...rows.map(r => r.ts));
+    const gapH = (Date.now() - lastTs) / 3600000;
+    const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: OrderStats.TZ, hour: 'numeric', hourCycle: 'h23' }).format(new Date()));
+    if (gapH < NO_SALES_HOURS || noSalesAlertedFor === lastTs || hour < 9 || hour >= 23) return;
+    noSalesAlertedFor = lastTs;
+    const msg = `😴 Nessuna vendita da ${Math.floor(gapH)}h\nUltimo ordine: ${new Date(lastTs).toLocaleString('it-BE', { timeZone: OrderStats.TZ })}\nForse è ora di una story / un post?`;
+    const targets = new Set([...alertSubscribers, ...(ADMIN_CHAT_ID ? [ADMIN_CHAT_ID] : [])].map(String));
+    for (const id of targets) { try { await tgSend(id, msg); } catch (_) {} }
+  } catch (e) {
+    console.error('checkNoSales error:', e?.response?.data || e?.message || e);
+  }
+}
+setInterval(checkNoSales, 15 * 60 * 1000);
 
 async function handleCapacitiesDebug(chatId) {
   await ensureStatsFresh();
@@ -1433,6 +1524,21 @@ app.post('/webhook', (req, res) => {
         } catch (e) {
           await tgSend(chatId, `❌ /biglietti errore: ${e?.message || String(e)}`);
         }
+        return;
+      }
+
+      if (text.startsWith('/oggi')) {
+        await handleOrdersCommand(chatId, 'today');
+        return;
+      }
+
+      if (text.startsWith('/waves')) {
+        try { await handleWavesCommand(chatId); } catch (e) { await tgSend(chatId, `❌ /waves errore: ${e?.message || String(e)}`); }
+        return;
+      }
+
+      if (text.startsWith('/promo')) {
+        try { await handlePromoCommand(chatId); } catch (e) { await tgSend(chatId, `❌ /promo errore: ${e?.message || String(e)}`); }
         return;
       }
 
