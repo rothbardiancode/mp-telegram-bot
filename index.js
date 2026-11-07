@@ -19,6 +19,10 @@
  * WEEZTIX_API_BASE (default https://api.weeztix.com) - dashboard API base
  * WEEZTIX_AS (optional; if set, overrides any ?as=... embedded in WEEZTIX_EVENT_GUID)
  *
+ * Orders stats (/trend_vendite, /best, /last10):
+ * ORDERS_SINCE (ISO date, e.g. 2026-10-01) - when sales for the current event started; default: all orders
+ * ORDER_CHANNELS (default "shop") - purchase channels counted as sales
+ *
  * Redis (Upstash REST):
  * REDIS_URL
  * REDIS_TOKEN
@@ -27,6 +31,7 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
+const OrderStats = require('./orders-stats');
 
 const app = express();
 app.use(express.json());
@@ -1101,6 +1106,96 @@ async function handleOrdersMeta(chatId) {
   await tgSendLong(chatId, `🧪 ORDERS META\n\n${out.join('\n\n')}`);
 }
 
+// -------------------- Orders (sales trend / best times / last buyers) --------------------
+// /orders is company-wide (all events of the shop) and has no event filter, so use
+// ORDERS_SINCE (ISO date, e.g. 2026-10-01) to mark when sales for the current event started.
+// ORDER_CHANNELS: purchase channels counted as sales (default "shop").
+const ORDERS_SINCE_MS = process.env.ORDERS_SINCE ? Date.parse(process.env.ORDERS_SINCE) || 0 : 0;
+const ORDER_CHANNELS = (process.env.ORDER_CHANNELS || 'shop').split(',').map(s => s.trim()).filter(Boolean);
+const ORDERS_CACHE_MS = 5 * 60 * 1000;
+let ordersCache = { at: 0, rows: [] };
+let ordersInflight = null;
+
+async function fetchOrdersPage(page, perPage) {
+  const qs = qsForDashboard();
+  const sep = qs ? '&' : '?';
+  const base = `/orders${qs}${sep}per_page=${perPage}&page=${page}&include=tickets_count`;
+  const call = (path) => withRetry(() => weeztixGet(path, { timeout: 30000, companyScoped: true }), { retries: 2, initialDelayMs: 800 });
+  try {
+    return (await call(`${base}&status_equals=paid`)).data;
+  } catch (e) {
+    if (e?.response?.status === 400) return (await call(base)).data; // filter rejected: filter client-side below
+    throw e;
+  }
+}
+
+const keepOrder = (o) => o && o.status === 'paid' && ORDER_CHANNELS.includes(o.purchase_channel);
+
+// All qualifying orders since ORDERS_SINCE (or ever), newest first. Cached for 5 min.
+async function loadOrders({ force = false } = {}) {
+  if (!force && Date.now() - ordersCache.at < ORDERS_CACHE_MS) return ordersCache.rows;
+  if (ordersInflight) return ordersInflight;
+  ordersInflight = (async () => {
+    const seen = new Set();
+    const rows = [];
+    for (let page = 1; page <= 300; page++) {
+      const d = await fetchOrdersPage(page, 100);
+      const data = Array.isArray(d?.data) ? d.data : [];
+      let oldest = Infinity;
+      for (const o of data) {
+        const r = OrderStats.toRow(o);
+        if (r.ts < oldest) oldest = r.ts;
+        if (!keepOrder(o) || seen.has(r.guid)) continue;
+        if (ORDERS_SINCE_MS && r.ts < ORDERS_SINCE_MS) continue;
+        seen.add(r.guid);
+        rows.push(r);
+      }
+      if (!data.length || page >= (d.last_page || 1)) break;
+      if (ORDERS_SINCE_MS && oldest < ORDERS_SINCE_MS) break; // newest-first: nothing older is needed
+    }
+    ordersCache = { at: Date.now(), rows };
+    return rows;
+  })().finally(() => { ordersInflight = null; });
+  return ordersInflight;
+}
+
+// Only the latest orders (cheap): scans a few pages until n qualifying ones are found.
+async function loadLatestOrders(n = 10) {
+  const rows = [];
+  for (let page = 1; page <= 5 && rows.length < n; page++) {
+    const d = await fetchOrdersPage(page, 50);
+    const data = Array.isArray(d?.data) ? d.data : [];
+    for (const o of data) if (keepOrder(o)) rows.push(OrderStats.toRow(o));
+    if (!data.length || page >= (d.last_page || 1)) break;
+  }
+  return rows;
+}
+
+async function handleOrdersCommand(chatId, kind) {
+  try {
+    if (kind === 'last10') {
+      await tgSend(chatId, OrderStats.formatLast(await loadLatestOrders(10), 10));
+      return;
+    }
+    const cold = Date.now() - ordersCache.at >= ORDERS_CACHE_MS;
+    if (cold) await tgSend(chatId, '⏳ Carico gli ordini da Weeztix…');
+    const rows = await loadOrders();
+    if (!rows.length) {
+      await tgSend(chatId, '📭 Nessun ordine pagato trovato' + (ORDERS_SINCE_MS ? ` dal ${process.env.ORDERS_SINCE}` : '') + '.');
+      return;
+    }
+    if (kind === 'trend') {
+      await tgSend(chatId, OrderStats.formatTrend(OrderStats.computeTrend(rows, Date.now(), ORDERS_SINCE_MS)) +
+        (ORDERS_SINCE_MS ? '' : '\n\nℹ️ ORDERS_SINCE non impostato: "dall\'inizio" include tutti gli eventi dello shop.'));
+    } else {
+      await tgSend(chatId, OrderStats.formatBest(OrderStats.computeBest(rows)));
+    }
+  } catch (e) {
+    const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 800) : (e?.message || String(e));
+    await tgSend(chatId, `❌ Errore ordini: ${detail}`);
+  }
+}
+
 async function handleCapacitiesDebug(chatId) {
   await ensureStatsFresh();
   await ensureCapacitiesFresh();
@@ -1338,6 +1433,21 @@ app.post('/webhook', (req, res) => {
         } catch (e) {
           await tgSend(chatId, `❌ /biglietti errore: ${e?.message || String(e)}`);
         }
+        return;
+      }
+
+      if (text.startsWith('/trend_vendite')) {
+        await handleOrdersCommand(chatId, 'trend');
+        return;
+      }
+
+      if (text.startsWith('/best')) {
+        await handleOrdersCommand(chatId, 'best');
+        return;
+      }
+
+      if (text.startsWith('/last10')) {
+        await handleOrdersCommand(chatId, 'last10');
         return;
       }
 
