@@ -1057,6 +1057,50 @@ async function handleOrdersDebug(chatId) {
   await tgSendLong(chatId, `🧪 ORDERS DEBUG\nEvent GUID: ${g}\n\n${lines.join('\n\n')}`);
 }
 
+// Inspect /orders metadata: pagination, sort order, available __filters/__includes/__rules,
+// and what each include adds to an order. Used to design /trend, /best and /last10.
+async function handleOrdersMeta(chatId) {
+  const qs = qsForDashboard();
+  const sep = qs ? '&' : '?';
+  const g = WEEZTIX_EVENT_GUID;
+  const out = [];
+  const short = (v, n = 900) => JSON.stringify(v)?.slice(0, n);
+
+  const base = await weeztixGet(`/orders${qs}`, { timeout: 25000, companyScoped: true });
+  const d = base.data || {};
+  const rows = Array.isArray(d.data) ? d.data : [];
+  out.push(
+    `PAGING: total=${d.total} per_page=${d.per_page} last_page=${d.last_page} current=${d.current_page}\n` +
+    `FIRST created_at=${rows[0]?.created_at} | LAST on page=${rows[rows.length - 1]?.created_at}\n` +
+    `ORDER KEYS: ${Object.keys(rows[0] || {}).join(', ')}\n` +
+    `STATUSES on page: ${[...new Set(rows.map(r => r.status))].join(', ')}\n` +
+    `__filters: ${short(d.__filters)}\n__includes: ${short(d.__includes)}\n__rules: ${short(d.__rules, 700)}`
+  );
+
+  const tryReq = async (label, path) => {
+    try {
+      const r = await weeztixGet(path, { timeout: 25000, companyScoped: true });
+      const rr = Array.isArray(r.data?.data) ? r.data.data : [];
+      const newKeys = Object.keys(rr[0] || {}).filter(k => !(k in (rows[0] || {})));
+      out.push(`✅ ${label}: total=${r.data?.total} per_page=${r.data?.per_page} items=${rr.length}` +
+        (newKeys.length ? `\n   new keys: ${newKeys.join(', ')}\n   sample: ${short(Object.fromEntries(newKeys.map(k => [k, rr[0][k]])), 1200)}` : ''));
+    } catch (e) {
+      out.push(`❌ ${label}: ${e?.response?.status || 'ERR'} ${short(e?.response?.data, 200) || e?.message}`);
+    }
+  };
+
+  await tryReq('per_page=100', `/orders${qs}${sep}per_page=100`);
+  const inc = d.__includes;
+  const incNames = Array.isArray(inc) ? inc : (inc && typeof inc === 'object' ? Object.keys(inc) : []);
+  for (const name of incNames.slice(0, 8)) {
+    await tryReq(`include=${name}`, `/orders${qs}${sep}include=${encodeURIComponent(name)}`);
+  }
+  await tryReq('event filter (event_guid)', `/orders${qs}${sep}event_guid=${g}`);
+  await tryReq('event filter (filter[event])', `/orders${qs}${sep}filter[event]=${g}`);
+
+  await tgSendLong(chatId, `🧪 ORDERS META\n\n${out.join('\n\n')}`);
+}
+
 async function handleCapacitiesDebug(chatId) {
   await ensureStatsFresh();
   await ensureCapacitiesFresh();
@@ -1153,6 +1197,16 @@ app.post('/webhook', (req, res) => {
 
       if (text.startsWith('/ticket_raw')) {
         await handleTicketRaw(chatId);
+        return;
+      }
+
+      if (text.startsWith('/orders_meta')) {
+        try {
+          await handleOrdersMeta(chatId);
+        } catch (e) {
+          const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 800) : (e?.message || String(e));
+          await tgSend(chatId, `❌ /orders_meta errore: ${detail}`);
+        }
         return;
       }
 
