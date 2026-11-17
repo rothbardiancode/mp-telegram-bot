@@ -19,6 +19,11 @@
  * WEEZTIX_API_BASE (default https://api.weeztix.com) - dashboard API base
  * WEEZTIX_AS (optional; if set, overrides any ?as=... embedded in WEEZTIX_EVENT_GUID)
  *
+ * Orders stats (/trend_vendite, /best, /last10):
+ * ORDERS_SINCE (ISO date, e.g. 2026-10-01) - when sales for the current event started; default: all orders
+ * ORDER_CHANNELS (default "shop") - purchase channels counted as sales
+ * NO_SALES_HOURS (default 12; 0 = off) - alert after this many hours without a sale
+ *
  * Redis (Upstash REST):
  * REDIS_URL
  * REDIS_TOKEN
@@ -27,6 +32,7 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
+const OrderStats = require('./orders-stats');
 
 const app = express();
 app.use(express.json());
@@ -86,11 +92,19 @@ const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || null;
 // Organizer opt-in alerts (DM)
 const alertSubscribers = new Set();
 
-// Sellout alerts (sold-based)
+// Overall event sell-out alerts (based on MP_CAPACITY)
 const selloutAlerts = { p80: false, p90: false, p95: false, p100: false };
 
 // Door alerts (scanned-based)
 const doorAlerts = { p70: false, p85: false, p95: false };
+
+// Per-ticket-wave alerts: ticketId -> {p80, p90, p100}
+const ticketWaveAlerts = new Map();
+
+function getTicketAlertState(id) {
+  if (!ticketWaveAlerts.has(id)) ticketWaveAlerts.set(id, { p80: false, p90: false, p100: false });
+  return ticketWaveAlerts.get(id);
+}
 
 async function broadcastAlert(message) {
   const ids = Array.from(alertSubscribers);
@@ -117,7 +131,7 @@ async function redisGet(key) {
     const url = `${REDIS_URL}/get/${encodeURIComponent(key)}`;
     const r = await axios.post(url, null, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
-      timeout: 10000
+      timeout: 3000
     });
     return typeof r.data?.result === 'string' ? r.data.result : null;
   } catch (e) {
@@ -135,7 +149,7 @@ async function redisSet(key, value) {
         Authorization: `Bearer ${REDIS_TOKEN}`,
         'Content-Type': 'text/plain'
       },
-      timeout: 10000
+      timeout: 3000
     });
   } catch (e) {
     console.error('Redis SET error:', e?.response?.data || e.message || e);
@@ -144,22 +158,16 @@ async function redisSet(key, value) {
 
 // -------------------- Ticket mapping (fallback — /event/{guid}/ticket 404s for this tenant) --------------------
 const TICKET_MAP = {
-// Brunch
-  "4b52e1cd-570c-4f5b-8a5a-62c79951aadd": "Brunch + Serata",
-  "a0ecbc6e-c420-4281-84e0-5f210ee1bb2f": "Brunch + Serata (close friends)",
-// Night
-  "04917b6f-5669-4d98-a85d-1c7f8be24e0b": "Wave 3 (Night)",
-  "2e7f5a74-b80f-49ce-bb8a-571fdde430c1": "Wave 1 (Night)",
+  "04917b6f-5669-4d98-a85d-1c7f8be24e0b": "Wave 3",
+  "2e7f5a74-b80f-49ce-bb8a-571fdde430c1": "Wave 1",
   "8ca0ea97-c33d-4803-a628-bbc962e13538": "Wave 2",
-  "b69a81d2-5347-40bb-b5bd-2e7c8f647cad": "Omaggio (Night)"
+  "b69a81d2-5347-40bb-b5bd-2e7c8f647cad": "Omaggio"
 };
 const PRICE_MAP = {
-  "Brunch + Serata":                  31.33,
-  "Brunch + Serata (close friends)":  21.90,
-  "Wave 1 (Night)":                   13.82,
-  "Wave 2 (Night)":                   16.74,
-  "Wave 3 (Night)":                   9.81,
-  "Omaggio (Night)":                  0
+  "Wave 1":   13.82,
+  "Wave 2":   16.74,
+  "Wave 3":   9.81,
+  "Omaggio":  0
 };
 
 // Auto-discovered from /event/{guid}/ticket response
@@ -318,13 +326,11 @@ async function ensureAccessToken() {
 }
 
 // -------------------- Robust parsing of WEEZTIX_EVENT_GUID + ?as=... --------------------
-const WEEZTIX_EVENT_GUID_RAW = (process.env.WEEZTIX_EVENT_GUID_BRUNCH || process.env.WEEZTIX_EVENT_GUID || '').trim();
-const [WEEZTIX_EVENT_GUID_CLEAN, EMBEDDED_QS_PART] = WEEZTIX_EVENT_GUID_RAW.split('?');
-const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
-
-// NIGHT event
-const WEEZTIX_EVENT_GUID_NIGHT_RAW = (process.env.WEEZTIX_EVENT_GUID_NIGHT || '').trim();
+// Night-only event (brunch event deleted)
+const WEEZTIX_EVENT_GUID_NIGHT_RAW = (process.env.WEEZTIX_EVENT_GUID_NIGHT || process.env.WEEZTIX_EVENT_GUID || '').trim();
 const WEEZTIX_EVENT_GUID_NIGHT = WEEZTIX_EVENT_GUID_NIGHT_RAW.split('?')[0];
+const EMBEDDED_QS_PART = WEEZTIX_EVENT_GUID_NIGHT_RAW.split('?')[1];
+const EMBEDDED_QS = EMBEDDED_QS_PART ? `?${EMBEDDED_QS_PART}` : '';
 
 // Strip accidental leading '?as=' if user set the full query string instead of just the GUID value
 const WEEZTIX_AS = (process.env.WEEZTIX_AS || '').trim().replace(/^\?as=/i, '').replace(/^as=/i, '');
@@ -334,7 +340,7 @@ function qsForDashboard() {
   return AS_QS || EMBEDDED_QS || '';
 }
 
-const WEEZTIX_EVENT_GUID = WEEZTIX_EVENT_GUID_CLEAN;
+const WEEZTIX_EVENT_GUID = WEEZTIX_EVENT_GUID_NIGHT;
 
 // -------------------- API base --------------------
 const WEEZTIX_API_BASE = process.env.WEEZTIX_API_BASE || 'https://api.weeztix.com';
@@ -467,6 +473,28 @@ function parseWeeztixStats(data) {
   return out;
 }
 
+async function fetchStatsForGuid(guid) {
+  const statsUrl = `https://api.weeztix.com/statistics/dashboard/${guid}${qsForDashboard()}`;
+  const callApi = async () => {
+    await ensureAccessToken();
+    return axios.get(statsUrl, {
+      headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
+      timeout: 30000
+    });
+  };
+  try {
+    return await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+  } catch (e) {
+    const status = e?.response?.status;
+    const msg = e?.response?.data?.error_description || '';
+    if (status === 401 || (status === 400 && msg.includes('JWT'))) {
+      await refreshAccessToken();
+      return withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+    }
+    throw e;
+  }
+}
+
 async function fetchWeeztixStats() {
   try {
     if (!WEEZTIX_EVENT_GUID) {
@@ -474,38 +502,20 @@ async function fetchWeeztixStats() {
       return;
     }
 
-    const statsUrl = `https://api.weeztix.com/statistics/dashboard/${WEEZTIX_EVENT_GUID}${qsForDashboard()}`;
+    const allParsed = [];
 
-    const callApi = async () => {
-      await ensureAccessToken();
-      return axios.get(statsUrl, {
-        headers: { Authorization: `Bearer ${WEEZTIX_ACCESS_TOKEN}` },
-        timeout: 30000
-      });
-    };
-
-    let resp;
     try {
-      resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
+      const resp = await fetchStatsForGuid(WEEZTIX_EVENT_GUID);
+      weeztixLastRaw = resp.data ?? { _empty: true };
+      const parsed = parseWeeztixStats(resp.data);
+      allParsed.push(...parsed);
     } catch (e) {
-      const status = e?.response?.status;
-      const msg = e?.response?.data?.error_description || '';
-      if (status === 401 || (status === 400 && msg.includes('JWT'))) {
-        await refreshAccessToken();
-        resp = await withRetry(() => callApi(), { retries: 2, initialDelayMs: 800 });
-      } else {
-        throw e;
-      }
+      console.error(`fetchWeeztixStats: failed for guid ${WEEZTIX_EVENT_GUID}:`, e?.message || e);
     }
 
-    weeztixLastRaw = resp.data ?? { _empty: true };
-    const parsed = parseWeeztixStats(resp.data);
+    const parsed = allParsed;
     if (!parsed.length) {
-      const topKeys = resp.data && typeof resp.data === 'object' ? Object.keys(resp.data).slice(0, 6).join(', ') : '?';
-      const hasAggs = resp.data?.aggregations || Object.values(resp.data || {}).some(v => v?.aggregations);
-      weeztixLastError = hasAggs
-        ? `Stats fetched but all buckets empty (hits.total=0). Possible wrong event GUID or no sales yet. Top keys: ${topKeys}`
-        : `Stats fetched but unrecognised structure. Top keys: ${topKeys}`;
+      weeztixLastError = 'Stats fetched but no data from any event GUID';
       return;
     }
 
@@ -534,6 +544,32 @@ async function fetchWeeztixStats() {
       if (pctDoor >= 0.70 && !doorAlerts.p70) { doorAlerts.p70 = true; await broadcastAlert(`🚪 Porta: 70% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}`); }
       if (pctDoor >= 0.85 && !doorAlerts.p85) { doorAlerts.p85 = true; await broadcastAlert(`⚠️ Porta: 85% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nOcchio fila / sicurezza.`); }
       if (pctDoor >= 0.95 && !doorAlerts.p95) { doorAlerts.p95 = true; await broadcastAlert(`🚨 Porta: 95% capienza\nEntrati: ${scannedTotalNow}/${MP_CAPACITY}\nValuta STOP ingressi.`); }
+    }
+
+    // Per-ticket-wave alerts
+    if (alertSubscribers.size > 0) {
+      for (const t of weeztixTicketStats) {
+        const cap = weeztixCapByTicketId[t.id];
+        if (!cap || cap <= 0) continue;
+        const sold = Number(t.sold) || 0;
+        const remaining = Math.max(0, cap - sold);
+        const pct = sold / cap;
+        const label = ticketLabel(t.id);
+        const state = getTicketAlertState(t.id);
+
+        if (pct >= 0.80 && !state.p80) {
+          state.p80 = true;
+          await broadcastAlert(`🔥 ${label}: 80% esaurito\nVenduti: ${sold}/${cap} | Rimasti: ${remaining}`);
+        }
+        if (pct >= 0.90 && !state.p90) {
+          state.p90 = true;
+          await broadcastAlert(`🚀 ${label}: 90% esaurito\nVenduti: ${sold}/${cap} | Rimasti: ${remaining}`);
+        }
+        if (pct >= 1.00 && !state.p100) {
+          state.p100 = true;
+          await broadcastAlert(`🟥 ${label}: ESAURITO\nVenduti: ${sold}/${cap} | Rimasti: 0`);
+        }
+      }
     }
 
   } catch (e) {
@@ -591,13 +627,13 @@ function extractTicketArray(obj) {
   for (const [k, v] of Object.entries(obj)) {
     if (Array.isArray(v) && k.toLowerCase().includes('ticket')) return v;
   }
-   
+
   // Handle numeric-keyed object: {0: {...}, 1: {...}}
   const keys = Object.keys(obj);
   if (keys.length && keys.every(k => /^\d+$/.test(k))) {
     return keys.map(k => obj[k]);
   }
- 
+
   return null;
 }
 
@@ -664,15 +700,15 @@ function extractCapacityDeep(ticketObj, soldById) {
 
   const pl = best.path.toLowerCase();
   // ✅ HARD EARLY RETURN: in this tenant, available_stock is TOTAL capacity, never remaining.
-  // This prevents any later logic from setting derived=true or altering cap.
-  if (pl.includes('available_stock')) {
-    const cap = Number(best.value);
-    if (!Number.isFinite(cap) || cap < 0) return { cap: null, meta: null };
-    return {
-      cap,
-      meta: { fieldPath: best.path, rawValue: best.value, derived: false }
-    };
-  }
+// This prevents any later logic from setting derived=true or altering cap.
+if (pl.includes('available_stock')) {
+  const cap = Number(best.value);
+  if (!Number.isFinite(cap) || cap < 0) return { cap: null, meta: null };
+  return {
+    cap,
+    meta: { fieldPath: best.path, rawValue: best.value, derived: false }
+  };
+}
 
   let cap = Number(best.value);
   let derived = false;
@@ -710,8 +746,9 @@ async function fetchCapacitiesFromApi() {
   for (const t of weeztixTicketStats) soldById[t.id] = Number(t.sold || 0);
 
   const qs = qsForDashboard();
+  const join = qs ? '&' : '?';
 
-  const eventGuids = [WEEZTIX_EVENT_GUID, ...(WEEZTIX_EVENT_GUID_NIGHT ? [WEEZTIX_EVENT_GUID_NIGHT] : [])];
+  const eventGuids = [WEEZTIX_EVENT_GUID];
 
   const combinedMap = {};
   const combinedMetaMap = {};
@@ -743,13 +780,12 @@ async function fetchCapacitiesFromApi() {
 
         if (!arr || !arr.length) continue;
 
-        const isNight = guid === WEEZTIX_EVENT_GUID_NIGHT;
         for (const t of arr) {
           const id = extractTicketId(t);
           if (!id) continue;
 
-           const tName = t.name || t.title || t.label;
-          if (tName) combinedNameById[String(id)] = isNight ? `${tName} (Night)` : tName;
+          const tName = t.name || t.title || t.label;
+          if (tName) combinedNameById[String(id)] = tName;
           if (typeof t.min_price === 'number') combinedPriceById[String(id)] = t.min_price / 100;
 
           const { cap, meta } = extractCapacityDeep(t, soldById);
@@ -790,7 +826,7 @@ async function ensureCapacitiesFresh() {
     try {
       const obj = JSON.parse(cached);
       if (obj?.map && typeof obj.map === 'object') {
-          const redisAgeMs = obj.ts ? (Date.now() - Date.parse(obj.ts)) : Infinity;
+        const redisAgeMs = obj.ts ? (Date.now() - Date.parse(obj.ts)) : Infinity;
         if (redisAgeMs <= CAP_CACHE_MAX_AGE_MS) {
           weeztixCapByTicketId = obj.map;
           weeztixCapMetaByTicketId = obj.metaMap || {};
@@ -800,7 +836,7 @@ async function ensureCapacitiesFresh() {
           weeztixCapLastError = null;
           return;
         }
-        // Redis cache is stale — fall through to live API fetch;
+        // Redis cache is stale — fall through to live API fetch
       }
     } catch (_) {}
   }
@@ -962,8 +998,7 @@ async function handlePasswordsCommand(chatId) {
 async function handleTicketRaw(chatId) {
   const qs = qsForDashboard();
   const events = [
-    { label: 'BRUNCH', guid: WEEZTIX_EVENT_GUID },
-    ...(WEEZTIX_EVENT_GUID_NIGHT ? [{ label: 'NIGHT', guid: WEEZTIX_EVENT_GUID_NIGHT }] : [])
+    { label: 'NIGHT', guid: WEEZTIX_EVENT_GUID }
   ];
   for (const { label, guid } of events) {
     try {
@@ -986,6 +1021,271 @@ async function handleTicketRaw(chatId) {
     }
   }
 }
+
+// Probe likely Weeztix order/transaction endpoints and show status + shape of each,
+// so we can see which one returns per-order data (timestamps, emails, amounts).
+async function handleOrdersDebug(chatId) {
+  const qs = qsForDashboard();
+  const sep = qs ? '&' : '?';
+  const g = WEEZTIX_EVENT_GUID;
+  const paths = [
+    `/order${qs}`,
+    `/orders${qs}`,
+    `/transaction${qs}`,
+    `/transactions${qs}`,
+    `/event/${g}/order${qs}`,
+    `/event/${g}/orders${qs}`,
+    `/event/${g}/transaction${qs}`,
+    `/event/${g}/ticket/sold${qs}`,
+    `/order${qs}${sep}event=${g}`,
+    `/transaction${qs}${sep}event=${g}`
+  ];
+
+  const shapeOf = (v, depth = 0) => {
+    if (Array.isArray(v)) return `array(${v.length})`;
+    if (v && typeof v === 'object') return depth ? 'object' : `{${Object.keys(v).slice(0, 25).join(', ')}}`;
+    return typeof v;
+  };
+
+  const lines = [];
+  for (const path of paths) {
+    try {
+      const r = await weeztixGet(path, { timeout: 25000, companyScoped: true });
+      const d = r.data;
+      const arr = extractTicketArray(d) || (Array.isArray(d) ? d : null);
+      lines.push(`✅ ${r.status} ${path}\n   shape: ${shapeOf(d)}${arr ? `\n   items: ${arr.length}\n   first: ${JSON.stringify(arr[0]).slice(0, 1200)}` : `\n   body: ${JSON.stringify(d).slice(0, 600)}`}`);
+    } catch (e) {
+      const st = e?.response?.status || 'ERR';
+      const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 150) : (e?.message || '');
+      lines.push(`❌ ${st} ${path}  ${detail}`);
+    }
+  }
+  await tgSendLong(chatId, `🧪 ORDERS DEBUG\nEvent GUID: ${g}\n\n${lines.join('\n\n')}`);
+}
+
+// Inspect /orders metadata: pagination, sort order, available __filters/__includes/__rules,
+// and what each include adds to an order. Used to design /trend, /best and /last10.
+async function handleOrdersMeta(chatId) {
+  const qs = qsForDashboard();
+  const sep = qs ? '&' : '?';
+  const g = WEEZTIX_EVENT_GUID;
+  const out = [];
+  const short = (v, n = 900) => JSON.stringify(v)?.slice(0, n);
+
+  const base = await weeztixGet(`/orders${qs}`, { timeout: 25000, companyScoped: true });
+  const d = base.data || {};
+  const rows = Array.isArray(d.data) ? d.data : [];
+  out.push(
+    `PAGING: total=${d.total} per_page=${d.per_page} last_page=${d.last_page} current=${d.current_page}\n` +
+    `FIRST created_at=${rows[0]?.created_at} | LAST on page=${rows[rows.length - 1]?.created_at}\n` +
+    `ORDER KEYS: ${Object.keys(rows[0] || {}).join(', ')}\n` +
+    `STATUSES on page: ${[...new Set(rows.map(r => r.status))].join(', ')}\n` +
+    `__filters: ${short(d.__filters)}\n__includes: ${short(d.__includes)}\n__rules: ${short(d.__rules, 700)}`
+  );
+
+  const tryReq = async (label, path) => {
+    try {
+      const r = await weeztixGet(path, { timeout: 25000, companyScoped: true });
+      const rr = Array.isArray(r.data?.data) ? r.data.data : [];
+      const newKeys = Object.keys(rr[0] || {}).filter(k => !(k in (rows[0] || {})));
+      out.push(`✅ ${label}: total=${r.data?.total} per_page=${r.data?.per_page} items=${rr.length}` +
+        (newKeys.length ? `\n   new keys: ${newKeys.join(', ')}\n   sample: ${short(Object.fromEntries(newKeys.map(k => [k, rr[0][k]])), 1200)}` : ''));
+    } catch (e) {
+      out.push(`❌ ${label}: ${e?.response?.status || 'ERR'} ${short(e?.response?.data, 200) || e?.message}`);
+    }
+  };
+
+  await tryReq('per_page=100', `/orders${qs}${sep}per_page=100`);
+  const inc = d.__includes;
+  const incNames = Array.isArray(inc) ? inc : (inc && typeof inc === 'object' ? Object.keys(inc) : []);
+  for (const name of incNames.slice(0, 8)) {
+    await tryReq(`include=${name}`, `/orders${qs}${sep}include=${encodeURIComponent(name)}`);
+  }
+  await tryReq('event filter (event_guid)', `/orders${qs}${sep}event_guid=${g}`);
+  await tryReq('event filter (filter[event])', `/orders${qs}${sep}filter[event]=${g}`);
+
+  await tgSendLong(chatId, `🧪 ORDERS META\n\n${out.join('\n\n')}`);
+}
+
+// -------------------- Orders (sales trend / best times / last buyers) --------------------
+// /orders is company-wide (all events of the shop) and has no event filter, so use
+// ORDERS_SINCE (ISO date, e.g. 2026-10-01) to mark when sales for the current event started.
+// ORDER_CHANNELS: purchase channels counted as sales (default "shop").
+const ORDERS_SINCE_MS = process.env.ORDERS_SINCE ? Date.parse(process.env.ORDERS_SINCE) || 0 : 0;
+const ORDER_CHANNELS = (process.env.ORDER_CHANNELS || 'shop').split(',').map(s => s.trim()).filter(Boolean);
+const ORDERS_CACHE_MS = 5 * 60 * 1000;
+let ordersCache = { at: 0, rows: [] };
+let ordersInflight = null;
+
+async function fetchOrdersPage(page, perPage) {
+  const qs = qsForDashboard();
+  const sep = qs ? '&' : '?';
+  const base = `/orders${qs}${sep}per_page=${perPage}&page=${page}&include=tickets_count`;
+  const call = (path) => withRetry(() => weeztixGet(path, { timeout: 30000, companyScoped: true }), { retries: 2, initialDelayMs: 800 });
+  try {
+    return (await call(`${base}&status_equals=paid`)).data;
+  } catch (e) {
+    if (e?.response?.status === 400) return (await call(base)).data; // filter rejected: filter client-side below
+    throw e;
+  }
+}
+
+const keepOrder = (o) => o && o.status === 'paid' && ORDER_CHANNELS.includes(o.purchase_channel);
+
+// All qualifying orders since ORDERS_SINCE (or ever), newest first. Cached for 5 min.
+async function loadOrders({ force = false } = {}) {
+  if (!force && Date.now() - ordersCache.at < ORDERS_CACHE_MS) return ordersCache.rows;
+  if (ordersInflight) return ordersInflight;
+  ordersInflight = (async () => {
+    const seen = new Set();
+    const rows = [];
+    for (let page = 1; page <= 300; page++) {
+      const d = await fetchOrdersPage(page, 100);
+      const data = Array.isArray(d?.data) ? d.data : [];
+      let oldest = Infinity;
+      for (const o of data) {
+        const r = OrderStats.toRow(o);
+        if (r.ts < oldest) oldest = r.ts;
+        if (!keepOrder(o) || seen.has(r.guid)) continue;
+        if (ORDERS_SINCE_MS && r.ts < ORDERS_SINCE_MS) continue;
+        seen.add(r.guid);
+        rows.push(r);
+      }
+      if (!data.length || page >= (d.last_page || 1)) break;
+      if (ORDERS_SINCE_MS && oldest < ORDERS_SINCE_MS) break; // newest-first: nothing older is needed
+    }
+    ordersCache = { at: Date.now(), rows };
+    return rows;
+  })().finally(() => { ordersInflight = null; });
+  return ordersInflight;
+}
+
+// Only the latest orders (cheap): scans a few pages until n qualifying ones are found.
+async function loadLatestOrders(n = 10) {
+  const rows = [];
+  for (let page = 1; page <= 5 && rows.length < n; page++) {
+    const d = await fetchOrdersPage(page, 50);
+    const data = Array.isArray(d?.data) ? d.data : [];
+    for (const o of data) if (keepOrder(o)) rows.push(OrderStats.toRow(o));
+    if (!data.length || page >= (d.last_page || 1)) break;
+  }
+  return rows;
+}
+
+async function handleOrdersCommand(chatId, kind) {
+  try {
+    if (kind === 'last10') {
+      await tgSend(chatId, OrderStats.formatLast(await loadLatestOrders(10), 10));
+      return;
+    }
+    const cold = Date.now() - ordersCache.at >= ORDERS_CACHE_MS;
+    if (cold) await tgSend(chatId, '⏳ Carico gli ordini da Weeztix…');
+    const rows = await loadOrders();
+    if (!rows.length) {
+      await tgSend(chatId, '📭 Nessun ordine pagato trovato' + (ORDERS_SINCE_MS ? ` dal ${process.env.ORDERS_SINCE}` : '') + '.');
+      return;
+    }
+    if (kind === 'today') {
+      await tgSend(chatId, OrderStats.formatToday(OrderStats.computeToday(rows, Date.now())));
+    } else if (kind === 'trend') {
+      await tgSend(chatId, OrderStats.formatTrend(OrderStats.computeTrend(rows, Date.now(), ORDERS_SINCE_MS)) +
+        (ORDERS_SINCE_MS ? '' : '\n\nℹ️ ORDERS_SINCE non impostato: "dall\'inizio" include tutti gli eventi dello shop.'));
+    } else {
+      await tgSend(chatId, OrderStats.formatBest(OrderStats.computeBest(rows)));
+    }
+  } catch (e) {
+    const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 800) : (e?.message || String(e));
+    await tgSend(chatId, `❌ Errore ordini: ${detail}`);
+  }
+}
+
+// -------------------- Waves (sold / share / revenue / scanned) --------------------
+async function handleWavesCommand(chatId) {
+  await ensureStatsFresh();
+  await ensureCapacitiesFresh();
+  if (!weeztixTicketStats.length) {
+    await tgSend(chatId, `🎟 /waves: nessun dato ancora.\nUltimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}`);
+    return;
+  }
+  const by = {};
+  for (const t of weeztixTicketStats) {
+    const label = ticketLabel(t.id);
+    const e = by[label] || (by[label] = { sold: 0, scanned: 0 });
+    e.sold += Number(t.sold || 0);
+    e.scanned += Number(t.scanned || 0);
+  }
+  const { grouped: caps } = groupCapacityByLabel();
+  const totalSold = Object.values(by).reduce((a, e) => a + e.sold, 0);
+  const totalScanned = Object.values(by).reduce((a, e) => a + e.scanned, 0);
+  let revenue = 0;
+  const lines = Object.entries(by).sort((a, b) => b[1].sold - a[1].sold).map(([label, e]) => {
+    const price = PRICE_MAP[label];
+    if (typeof price === 'number') revenue += price * e.sold;
+    const share = totalSold ? Math.round((e.sold / totalSold) * 100) : 0;
+    const cap = caps[label];
+    return `• ${label}: ${e.sold} (${share}%)` +
+      (cap ? ` · cap ${cap}, rimasti ${Math.max(0, cap - e.sold)}` : '') +
+      (typeof price === 'number' && price > 0 ? ` · ~€${(price * e.sold).toFixed(0)}` : '') +
+      (e.scanned ? ` · entrati ${e.scanned} (${Math.round((e.scanned / Math.max(1, e.sold)) * 100)}%)` : '');
+  });
+  await tgSendLong(chatId,
+    `🎟 VENDITE PER WAVE\n\n${lines.join('\n')}\n\n` +
+    `Totale: ${totalSold}${MP_CAPACITY ? `/${MP_CAPACITY}` : ''} venduti · ~€${revenue.toFixed(0)} (prezzi di listino, fee escluse)\n` +
+    (totalScanned ? `🚪 Entrati: ${totalScanned} (${Math.round((totalScanned / Math.max(1, totalSold)) * 100)}% dei venduti)` : '🚪 Entrati: nessuna scansione ancora'));
+}
+
+// -------------------- Promo codes usage (best effort: shows whatever usage fields Weeztix exposes) --------------------
+async function handlePromoCommand(chatId) {
+  let coupons = [];
+  try {
+    const r = await weeztixGet(`/coupon/normal${qsForDashboard()}`, { timeout: 25000, companyScoped: true });
+    coupons = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.results) ? r.data.results : (Array.isArray(r.data?.data) ? r.data.data : []));
+  } catch (e) {
+    const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 800) : (e?.message || String(e));
+    await tgSend(chatId, `❌ /promo: impossibile leggere i coupon.\n${detail}`);
+    return;
+  }
+  coupons = coupons.filter(isCouponEnabled);
+  if (!coupons.length) { await tgSend(chatId, '🏷 /promo: nessun promo code attivo.'); return; }
+
+  const usageKey = /(used|usage|redeem|uses|count|sold|orders)/i;
+  const lines = [];
+  let foundUsage = false;
+  for (const c of coupons) {
+    const name = c?.name || c?.title || c?.description || '(coupon)';
+    const usage = Object.entries(c).filter(([k, v]) => typeof v === 'number' && usageKey.test(k));
+    if (usage.length) foundUsage = true;
+    lines.push(`• ${name}${usage.length ? ' — ' + usage.map(([k, v]) => `${k}=${v}`).join(', ') : ''}`);
+  }
+  await tgSendLong(chatId,
+    `🏷 PROMO CODES (${coupons.length})\n\n${lines.join('\n')}\n\n` +
+    (foundUsage ? '' : `ℹ️ Weeztix non espone l'uso dei coupon in questa lista, né sugli ordini.\nCampi disponibili: ${Object.keys(coupons[0] || {}).join(', ')}`));
+}
+
+// -------------------- No-sales alert --------------------
+// Every 15 min: if the newest paid order is older than NO_SALES_HOURS (default 12; 0 = off),
+// alert once per gap. Only between 09:00 and 23:00 Brussels time, and not once sold out.
+const NO_SALES_HOURS = Number(process.env.NO_SALES_HOURS || 12);
+let noSalesAlertedFor = 0;
+
+async function checkNoSales() {
+  try {
+    if (!NO_SALES_HOURS || selloutAlerts.p100) return;
+    const rows = await loadLatestOrders(1);
+    if (!rows.length) return;
+    const lastTs = Math.max(...rows.map(r => r.ts));
+    const gapH = (Date.now() - lastTs) / 3600000;
+    const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: OrderStats.TZ, hour: 'numeric', hourCycle: 'h23' }).format(new Date()));
+    if (gapH < NO_SALES_HOURS || noSalesAlertedFor === lastTs || hour < 9 || hour >= 23) return;
+    noSalesAlertedFor = lastTs;
+    const msg = `😴 Nessuna vendita da ${Math.floor(gapH)}h\nUltimo ordine: ${new Date(lastTs).toLocaleString('it-BE', { timeZone: OrderStats.TZ })}\nForse è ora di una story / un post?`;
+    const targets = new Set([...alertSubscribers, ...(ADMIN_CHAT_ID ? [ADMIN_CHAT_ID] : [])].map(String));
+    for (const id of targets) { try { await tgSend(id, msg); } catch (_) {} }
+  } catch (e) {
+    console.error('checkNoSales error:', e?.response?.data || e?.message || e);
+  }
+}
+setInterval(checkNoSales, 15 * 60 * 1000);
 
 async function handleCapacitiesDebug(chatId) {
   await ensureStatsFresh();
@@ -1082,7 +1382,7 @@ app.post('/webhook', (req, res) => {
       // --- alerts ---
       if (text.startsWith('/alerts_on')) {
         alertSubscribers.add(chatId);
-        await tgSend(chatId, '🔔 Alert attivati (sell-out + porta se disponibile).');
+        await tgSend(chatId, '🔔 Alert attivati.\nRiceverai notifiche al 80%, 90% e 100% (esaurito) per ogni wave.');
         return;
       }
 
@@ -1118,6 +1418,25 @@ app.post('/webhook', (req, res) => {
         return;
       }
 
+      if (text.startsWith('/orders_meta')) {
+        try {
+          await handleOrdersMeta(chatId);
+        } catch (e) {
+          const detail = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 800) : (e?.message || String(e));
+          await tgSend(chatId, `❌ /orders_meta errore: ${detail}`);
+        }
+        return;
+      }
+
+      if (text.startsWith('/orders_debug')) {
+        try {
+          await handleOrdersDebug(chatId);
+        } catch (e) {
+          await tgSend(chatId, `❌ /orders_debug errore: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
       if (text.startsWith('/debugevents')) {
         try {
           const qs = qsForDashboard();
@@ -1140,6 +1459,21 @@ app.post('/webhook', (req, res) => {
         return;
       }
 
+      if (text.startsWith('/refresh_caps')) {
+        await tgSend(chatId, '🔄 Svuoto cache capacità e ri-fetcho da API...');
+        await redisSet('weeztix_ticket_capacities', '{}');
+        weeztixCapByTicketId = {};
+        weeztixCapMetaByTicketId = {};
+        weeztixCapLastOkAt = null;
+        ticketWaveAlerts.clear();
+        await fetchCapacitiesFromApi();
+        const count = Object.keys(weeztixCapByTicketId).length;
+        await tgSend(chatId, count
+          ? `✅ Capacità aggiornate: ${count} ticket trovati.\nUltimo OK: ${weeztixCapLastOkAt}`
+          : `❌ Nessuna capacità trovata.\nErrore: ${weeztixCapLastError || '—'}`);
+        return;
+      }
+
       if (text.startsWith('/capacities_debug')) {
         await handleCapacitiesDebug(chatId);
         return;
@@ -1150,29 +1484,17 @@ app.post('/webhook', (req, res) => {
         await handlePasswordsCommand(chatId);
         return;
       }
-      if (text.startsWith('/refresh_caps')) {
-        await tgSend(chatId, '🔄 Svuoto cache capacità e ri-fetcho da API...');
-        await redisSet('weeztix_ticket_capacities', '{}');
-        weeztixCapByTicketId = {};
-        weeztixCapMetaByTicketId = {};
-        weeztixCapLastOkAt = null;
-        await fetchCapacitiesFromApi();
-        const count = Object.keys(weeztixCapByTicketId).length;
-        await tgSend(chatId, count
-          ? `✅ Capacità aggiornate: ${count} ticket trovati.\nUltimo OK: ${weeztixCapLastOkAt}`
-          : `❌ Nessuna capacità trovata.\nErrore: ${weeztixCapLastError || '—'}`);
-        return;
-      }
- 
+
       if (text.startsWith('/biglietti')) {
+        try {
         await ensureStatsFresh();
         await ensureCapacitiesFresh();
 
         const { grouped: soldByLabel, total: soldTotal } = groupSoldByLabel();
         const { grouped: capByLabel } = groupCapacityByLabel();
- 
+
         if (!weeztixTicketStats.length && !Object.keys(capByLabel).length) {
-               await tgSend(chatId,
+          await tgSend(chatId,
             `🎟️ Nessun dato ancora.\n\n` +
             `Stats — Ultimo OK: ${weeztixLastOkAt || 'mai'}\nErrore: ${weeztixLastError || '—'}\n\n` +
             `Capacità — Ultimo OK: ${weeztixCapLastOkAt || 'mai'}\nErrore: ${weeztixCapLastError || '—'}\n\n` +
@@ -1181,22 +1503,7 @@ app.post('/webhook', (req, res) => {
           return;
         }
 
-               const allLabelSet = new Set([...Object.keys(soldByLabel), ...Object.keys(capByLabel)]);
-        const labels = [...allLabelSet].sort((a, b) => a.localeCompare(b, 'it'));
-        const lines = labels.map(label => {
-          const sold = soldByLabel[label] || 0;
-          const cap = capByLabel[label];
-          const price = priceByLabel[label];
-          const priceStr = typeof price === 'number' ? ` | €${price.toFixed(2)}/cad` : '';
-          if (typeof cap === 'number' && cap > 0) {
-            const remaining = Math.max(0, cap - sold);
-            return `• ${label}${priceStr}: sold=${sold} | remaining=${remaining}/${cap}`;
-          }
-           return `• ${label}: sold=${sold} | remaining=n/d`;
-          return `• ${label}${priceStr}: sold=${sold} | remaining=n/d`;
-        }).join('\n');
-
-         // Build price-per-label map
+        // Build price-per-label map
         const priceByLabel = {};
         for (const t of weeztixTicketStats) {
           const label = ticketLabel(t.id);
@@ -1211,7 +1518,20 @@ app.post('/webhook', (req, res) => {
             if (typeof price === 'number') priceByLabel[label] = price;
           }
         }
- 
+
+        const allLabelSet = new Set([...Object.keys(soldByLabel), ...Object.keys(capByLabel)]);
+        const labels = [...allLabelSet].sort((a, b) => a.localeCompare(b, 'it'));
+        const lines = labels.map(label => {
+          const sold = soldByLabel[label] || 0;
+          const cap = capByLabel[label];
+          const price = priceByLabel[label];
+          const priceStr = typeof price === 'number' ? ` | €${price.toFixed(2)}/cad` : '';
+          if (typeof cap === 'number' && cap > 0) {
+            const remaining = Math.max(0, cap - sold);
+            return `• ${label}${priceStr}: sold=${sold} | remaining=${remaining}/${cap}`;
+          }
+          return `• ${label}${priceStr}: sold=${sold} | remaining=n/d`;
+        }).join('\n');
 
         let revenue = 0;
         for (const t of weeztixTicketStats) {
@@ -1233,6 +1553,39 @@ app.post('/webhook', (req, res) => {
           chatId,
           `🎟 BIGLIETTI\n\n${lines}\n\nTotale sold: ${soldTotal}${soldPctLine}\n💸 Revenue stimata: €${revenue.toFixed(2)}\nAggiornato: ${weeztixLastOkAt || weeztixCapLastOkAt}${capNote}`
         );
+        } catch (e) {
+          await tgSend(chatId, `❌ /biglietti errore: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
+      if (text.startsWith('/oggi')) {
+        await handleOrdersCommand(chatId, 'today');
+        return;
+      }
+
+      if (text.startsWith('/waves')) {
+        try { await handleWavesCommand(chatId); } catch (e) { await tgSend(chatId, `❌ /waves errore: ${e?.message || String(e)}`); }
+        return;
+      }
+
+      if (text.startsWith('/promo')) {
+        try { await handlePromoCommand(chatId); } catch (e) { await tgSend(chatId, `❌ /promo errore: ${e?.message || String(e)}`); }
+        return;
+      }
+
+      if (text.startsWith('/trend_vendite')) {
+        await handleOrdersCommand(chatId, 'trend');
+        return;
+      }
+
+      if (text.startsWith('/best')) {
+        await handleOrdersCommand(chatId, 'best');
+        return;
+      }
+
+      if (text.startsWith('/last10')) {
+        await handleOrdersCommand(chatId, 'last10');
         return;
       }
 
@@ -1320,7 +1673,7 @@ app.post('/webhook', (req, res) => {
           : `⚡ Ritmo ingressi (ult 15m): ${delta15} (+${perHour}/h)`;
 
         const proxyNote = useProxy
-          ? '\nℹ️ Nota: non vedo "scanned" da Weeztix → uso i venduti come proxy (non ideale per la porta).'
+          ? '\nℹ️ Nota: non vedo “scanned” da Weeztix → uso i venduti come proxy (non ideale per la porta).'
           : '';
 
         await tgSend(
@@ -1355,7 +1708,35 @@ process.on('uncaughtException', (err) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => console.log('Bot live on port', PORT));
+// -------------------- Register Telegram webhook on startup --------------------
+// Telegram only knows the webhook URL if someone set it. Re-register on every boot so a
+// removed/changed webhook (or a redeploy to a new URL) heals itself.
+// URL = WEBHOOK_URL if set (full URL), else RENDER_EXTERNAL_URL (set by Render) + /webhook.
+async function ensureWebhook() {
+  const base = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+  const url = process.env.WEBHOOK_URL || (base ? `${base}/webhook` : '');
+  if (!url) {
+    console.warn('⚠️ No WEBHOOK_URL / RENDER_EXTERNAL_URL: skipping setWebhook');
+    return;
+  }
+  try {
+    const info = (await axios.get(`${TELEGRAM_API}/getWebhookInfo`, { timeout: 15000 })).data?.result || {};
+    if (info.url !== url) {
+      await axios.post(`${TELEGRAM_API}/setWebhook`, { url }, { timeout: 15000 });
+      console.log(`🔗 Webhook set to ${url} (was: ${info.url || 'none'})`);
+    } else {
+      console.log(`🔗 Webhook already correct: ${url}`);
+    }
+    if (info.last_error_message) console.warn('Telegram last webhook error:', info.last_error_message);
+  } catch (e) {
+    console.error('setWebhook failed:', e?.response?.data || e.message || e);
+  }
+}
+
+const server = app.listen(PORT, () => {
+  console.log('Bot live on port', PORT);
+  ensureWebhook();
+});
 server.on('error', (err) => {
   console.error('Server listen error:', err);
   process.exit(1);
