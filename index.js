@@ -1012,6 +1012,34 @@ async function handleCapacitiesDebug(chatId) {
   );
 }
 
+// -------------------- Spam guard ("SI MA STAI CALMO") --------------------
+// If the same user prompts the bot 3 times within 60 seconds, reply with a warning.
+const SPAM_WINDOW_MS = 60 * 1000;
+const SPAM_THRESHOLD = 3;
+const userPromptTimes = new Map(); // key: `${chatId}:${userId}` -> number[] (timestamps)
+
+function registerPromptAndCheckSpam(chatId, userId) {
+  const key = `${chatId}:${userId}`;
+  const now = Date.now();
+  const recent = (userPromptTimes.get(key) || []).filter(t => now - t < SPAM_WINDOW_MS);
+  recent.push(now);
+
+  if (recent.length >= SPAM_THRESHOLD) {
+    userPromptTimes.delete(key); // reset so the warning fires once per burst
+    return true;
+  }
+  userPromptTimes.set(key, recent);
+  return false;
+}
+
+// Periodically drop stale entries so the map doesn't grow forever
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, times] of userPromptTimes) {
+    if (!times.some(t => now - t < SPAM_WINDOW_MS)) userPromptTimes.delete(key);
+  }
+}, 5 * 60 * 1000).unref();
+
 // -------------------- Telegram webhook (ACK immediately, process async) --------------------
 app.post('/webhook', (req, res) => {
   res.sendStatus(200);
@@ -1023,6 +1051,10 @@ app.post('/webhook', (req, res) => {
 
       const chatId = msg.chat.id;
       const text = (msg.text || '').trim();
+
+      if (text && registerPromptAndCheckSpam(chatId, msg.from?.id ?? chatId)) {
+        await tgSend(chatId, 'SI MA STAI CALMO');
+      }
 
       // --- meta/ops ---
       if (text === '/whoami') {
